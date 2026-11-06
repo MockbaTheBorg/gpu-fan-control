@@ -1,0 +1,77 @@
+# Settings for a Supermicro board (tested shape: H11SSL-i, AST2500 BMC).
+# Copy this over fan-curve.toml in the package folder, then read every comment below -
+# the zone and the curve are the two things you must get right for your own box.
+#
+#   sudo gpu-fan-detect              check this board answers the Supermicro commands
+#   sudo gpu-fan-detect --spin-all   find out which zone the GPU fan is in
+#   sudo gpu-fan-control --check     what the controller would do, without touching a fan
+
+backend = "supermicro"
+
+# WHICH FAN: a Supermicro BMC sets the duty per ZONE, not per header, so every fan in the
+# zone follows this curve. On an H11SSL-i:
+#   zone 0 = the numbered headers  FAN1 FAN2 FAN3 FAN4 FAN5
+#   zone 1 = the lettered headers  FANA FANB
+# Put the GPU fan on FANA or FANB and set zone = 1: the CPU and case fans in zone 0 then
+# carry on under the BMC's own control, and only the GPU fan follows the GPU temperature.
+# If the GPU fan is in zone 0 along with the CPU fan, they all ramp together - it works,
+# but the machine is louder than it needs to be.
+# (`fan = 1` means the same thing; `zone` is just the clearer name for this backend.)
+zone = 1
+
+# WHICH TACHOMETER to watch for a stalled fan. Names come from `ipmitool sdr type Fan`;
+# gpu-fan-detect lists them with their current RPM. Empty means "every populated header
+# in the zone", which is a fine default once the zone holds only the GPU fan.
+tach = ["FANA"]
+
+# Seconds between GPU temperature checks.
+interval = 5
+
+# Duty (%) used when the GPU temperature can't be read.
+failsafe_duty = 100
+
+# THE DUTY FLOOR, and the one Supermicro-specific trap worth understanding. Each fan has
+# a lower critical threshold in the BMC's sensor table. If a tach reads below it, the BMC
+# decides the fan has failed and blasts every fan in the chassis to 100 %. The GPU then
+# cools, this controller lowers the duty, the BMC panics again - a loop that sounds like
+# the machine breathing. Boards differ; 30 % is a safe starting floor, and many fans stall
+# below about 20 % anyway.
+#   sudo gpu-fan-detect --spin --low 25    hold 25 % for a while and watch the RPM
+#   sudo ipmitool sensor get FANA          see the thresholds the BMC applies
+# Only lower this once you have watched the fan hold steady at the new floor for minutes.
+min_duty = 30
+
+# THE CURVE: [GPU temp in C, duty in %], straight lines between the points. Below the
+# first point its duty is used; above the last point, that point's duty.
+#
+# RETUNE THIS. These numbers came off a 250 W Tesla V100 behind one high-static-pressure
+# 4-pin fan in a different chassis. Yours has a different fan, duct and case airflow.
+# Load the GPU (nvidia-smi dmon, or a GEMM burn), watch `gpu-fan-status -w`, and aim for
+# the hottest GPU settling at least 5 C under its max operating temperature - 83 C on a
+# V100, so 76-78 C under full load is a good target.
+curve = [
+  [40, 30],
+  [50, 40],
+  [60, 55],
+  [70, 75],
+  [78, 100],
+]
+
+# Ramp-down after load drops (ramp-up is always immediate):
+# keep the current duty this many seconds after the GPU cools, to clear residual heat...
+hold_secs = 60
+# ...treating demand within this many % of the current duty as still loaded (temp jitter)...
+hold_band = 10
+# ...then lower the duty by at most this many % per check.
+step_down = 2
+
+# Fan failure detection: a watched tach below this for 3 checks while the fan is driven
+# logs a FAN FAULT (journalctl -p crit) and holds the fan at 100 %. 0 turns it off.
+# Set it well under the RPM the fan does at min_duty, so it only fires on a real stall.
+fan_min_rpm = 300
+
+# [supermicro]
+# full_mode = 1      # the mode manual duty needs: 1 = Full. Don't change without reason.
+# restore_mode = 0   # what to hand the board back to on exit. Unset means "whatever the
+#                    # mode was when the service started", which is usually right;
+#                    # 0 = Standard, 2 = Optimal, 4 = Heavy IO.

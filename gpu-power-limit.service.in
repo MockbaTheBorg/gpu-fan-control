@@ -1,0 +1,18 @@
+# Template: install.sh substitutes @BINDIR@ and @CONFIGDIR@. See gpu-fan-control.service.in.
+[Unit]
+Description=GPU cool mode: cap the GPU power limit at boot (preset: cool_watts in @CONFIGDIR@/power-limit.toml)
+After=nvidia-persistenced.service systemd-modules-load.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=GPU_FAN_CONFIG_DIR=@CONFIGDIR@
+ExecStart=@BINDIR@/gpu-power-limit cool
+# Stopping or disabling --now the unit puts the GPU back on its full default limit
+ExecStop=@BINDIR@/gpu-power-limit full
+# The driver may not be ready right after boot
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

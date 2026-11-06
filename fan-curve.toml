@@ -1,0 +1,39 @@
+# GPU-driven fan control settings, read by gpu-fan-control.service.
+# Saved changes are picked up automatically on the next check (no restart needed).
+# If the file has an error, the service logs it and keeps the last good settings:
+#   sudo journalctl -fu gpu-fan-control
+
+# BMC fan header to drive (1-6). The other headers stay on the BMC's Default curve.
+fan = 2
+
+# Seconds between GPU temperature checks.
+interval = 5
+
+# Duty (%) used when the GPU temperature can't be read.
+failsafe_duty = 100
+
+# Fan curve: [GPU temp in C, duty in %] points, linearly interpolated between them.
+# Below the first point uses its duty; above the last point uses its duty.
+# The BMC accepts 20..100 %; values outside that are clamped.
+# Measured on this FAN2 fan: 20% ~1600 RPM, 30% ~1800, 50% ~3400, 65% ~5000, 96% ~8500.
+# Full load (~250 W) settled at 76-77 C with this curve.
+curve = [
+  [40, 20],
+  [50, 30],
+  [60, 45],
+  [70, 70],
+  [78, 100],
+]
+
+# Ramp-down after load drops (ramp-up is always immediate):
+# keep the current duty this many seconds after the GPU cools, to clear residual heat...
+hold_secs = 60
+# ...treating demand within this many % of the current duty as still loaded (temp jitter)...
+hold_band = 10
+# ...then lower the duty by at most this many % per check.
+step_down = 2
+
+# Fan failure detection: if the fan's tach (FANn_1) reads below this many RPM for 3 checks
+# while it's being driven, log a FAN FAULT (journalctl -p crit) and hold the fan at 100 %
+# until it reads OK again. 0 turns it off. This fan does ~1600 RPM at 20 %.
+fan_min_rpm = 300

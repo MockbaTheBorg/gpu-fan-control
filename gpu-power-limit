@@ -1,0 +1,127 @@
+#!/usr/bin/python3
+"""Show or set the GPU board power limit ("cool mode" runs the GPU at fewer watts).
+
+  gpu-power-limit              show current limit, allowed range and draw
+  sudo gpu-power-limit cool    limit to cool_watts (quieter fan, a bit slower)
+  sudo gpu-power-limit full    back to the default limit (also: default, reset)
+  sudo gpu-power-limit 180     limit to 180 W
+  -i INDEX                     only this GPU (default: all GPUs, e.g. both in a 2-GPU box)
+
+Changing the limit is safe while the GPU is in use; it takes effect immediately.
+The limit lasts until reboot or driver reload, then the default applies again.
+"""
+import argparse
+import os
+import subprocess
+import sys
+import tomllib
+
+# Cool mode's watts. ~150 W measured on a Tesla V100: the GPU settles at ~68 C with the fan
+# at 62-65 %, against 76-77 C and 92-96 % at its full 250 W. Override it for other hardware
+# in power-limit.toml (cool_watts = 150) next to the other settings files; a value outside
+# the GPU's own allowed range is refused by nvidia-smi, and we check it first.
+DEFAULT_COOL_WATTS = 150
+
+
+def find_config(name):
+    """The settings file to use: GPU_FAN_CONFIG_DIR, then the folder this script sits in,
+    then the folder install.sh recorded in /etc/gpu-fan-control.conf (so an installed copy
+    in /usr/local/bin finds the settings wherever the package was unpacked), then
+    /etc/gpu-fan-control. Deliberately a local copy rather than an import from
+    fan_backend: this program depends on nothing but nvidia-smi."""
+    dirs = [os.environ.get("GPU_FAN_CONFIG_DIR"), os.path.dirname(os.path.realpath(__file__))]
+    try:
+        with open("/etc/gpu-fan-control.conf") as f:
+            dirs += [line.partition("=")[2].strip().strip("\"'") for line in f
+                     if line.startswith("CONFIG_DIR=")]
+    except OSError:
+        pass
+    dirs.append("/etc/gpu-fan-control")
+    for d in dirs:
+        if d and os.path.exists(os.path.join(d, name)):
+            return os.path.join(d, name)
+    return os.path.join(dirs[-1], name)
+
+
+def cool_watts():
+    """cool_watts from power-limit.toml, or the built-in default if there is no file."""
+    path = find_config("power-limit.toml")
+    try:
+        with open(path, "rb") as f:
+            value = tomllib.load(f).get("cool_watts", DEFAULT_COOL_WATTS)
+    except FileNotFoundError:
+        return DEFAULT_COOL_WATTS
+    except Exception as e:
+        print(f"Warning: {path} is unusable ({e}); using {DEFAULT_COOL_WATTS} W", file=sys.stderr)
+        return DEFAULT_COOL_WATTS
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        print(f"Warning: cool_watts in {path} must be a positive number; "
+              f"using {DEFAULT_COOL_WATTS} W", file=sys.stderr)
+        return DEFAULT_COOL_WATTS
+    return float(value)
+
+
+def smi(*args):
+    return subprocess.run(["nvidia-smi", *args], capture_output=True, text=True,
+                          timeout=20, check=True).stdout
+
+
+def gpus(index=None):
+    fields = "index,name,power.limit,power.default_limit,power.min_limit,power.max_limit,power.draw,temperature.gpu"
+    args = [f"--query-gpu={fields}", "--format=csv,noheader,nounits"]
+    if index is not None:
+        args += ["-i", str(index)]
+    rows = []
+    for line in smi(*args).strip().splitlines():
+        idx, name, limit, default, lo, hi, draw, temp = (f.strip() for f in line.split(","))
+        rows.append(dict(index=idx, name=name, limit=float(limit), default=float(default),
+                         min=float(lo), max=float(hi), draw=draw, temp=temp))
+    return rows
+
+
+def show(index):
+    cool = cool_watts()
+    for g in gpus(index):
+        mode = ("default" if g["limit"] == g["default"]
+                else "cool" if g["limit"] == cool else "custom")
+        print(f"GPU{g['index']} {g['name']}: limit {g['limit']:.0f} W ({mode}), "
+              f"default {g['default']:.0f} W, allowed {g['min']:.0f}-{g['max']:.0f} W; "
+              f"now {g['draw']} W, {g['temp']} C")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Show or set the GPU power limit.")
+    ap.add_argument("limit", nargs="?", help="cool | full (default, reset) | WATTS; omit to show")
+    ap.add_argument("-i", "--index", type=int, help="GPU index (default: all)")
+    args = ap.parse_args()
+    if args.limit is None:
+        show(args.index)
+        return
+    if os.geteuid() != 0:
+        sys.exit("Setting the power limit needs root: run with sudo")
+    plan = []                       # check every GPU first, so a bad value changes none of them
+    for g in gpus(args.index):
+        word = args.limit.lower()
+        if word == "cool":
+            watts = cool_watts()
+        elif word in ("full", "default", "reset"):
+            watts = g["default"]
+        else:
+            try:
+                watts = float(word.removesuffix("w"))
+            except ValueError:
+                sys.exit(f"Unknown limit {args.limit!r}: use cool, full or a number of watts")
+        if not g["min"] <= watts <= g["max"]:
+            sys.exit(f"GPU{g['index']}: {watts:.0f} W is outside the allowed "
+                     f"{g['min']:.0f}-{g['max']:.0f} W")
+        plan.append((g["index"], watts))
+    for index, watts in plan:
+        try:
+            smi("-i", index, "-pl", f"{watts:.0f}")
+        except subprocess.CalledProcessError as e:
+            sys.exit(f"GPU{index}: nvidia-smi failed: {(e.stdout + e.stderr).strip()}")
+    show(args.index)
+
+
+if __name__ == "__main__":
+    main()

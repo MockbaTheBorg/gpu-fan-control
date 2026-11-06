@@ -1,0 +1,19 @@
+# Template: install.sh substitutes @BINDIR@ and @CONFIGDIR@ and writes the result to
+# /etc/systemd/system/gpu-fan-control.service. Edit this file, not that one, then re-run
+# install.sh - a curve change needs neither, the service re-reads fan-curve.toml itself.
+[Unit]
+Description=Drive a chassis fan from the GPU temperature (settings: @CONFIGDIR@/fan-curve.toml)
+# The IPMI backends need the in-band driver, which install.sh asks for in
+# /etc/modules-load.d/gpu-fan-control.conf; this waits for it to be loaded.
+After=systemd-modules-load.service
+
+[Service]
+Type=simple
+ExecStart=@BINDIR@/gpu-fan-control --config @CONFIGDIR@/fan-curve.toml
+# Backstop if the process dies without handing the fan back: return it to the board's own control
+ExecStopPost=@BINDIR@/gpu-fan-control --config @CONFIGDIR@/fan-curve.toml --restore
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

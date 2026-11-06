@@ -1,0 +1,18 @@
+# Template: install.sh substitutes @BINDIR@ and @CONFIGDIR@. See gpu-fan-control.service.in.
+[Unit]
+Description=GPU thermal guard: cap power at warn temp, kill GPU jobs and latch at trip temp (settings: @CONFIGDIR@/thermal-guard.toml)
+# After cool mode, so a latched trip's power cap is applied on top of it at boot
+After=nvidia-persistenced.service gpu-power-limit.service
+
+[Service]
+Type=simple
+ExecStart=@BINDIR@/gpu-thermal-guard --config @CONFIGDIR@/thermal-guard.toml
+Restart=always
+RestartSec=2
+# Holds the latch (state.json), so a trip survives restarts and reboots
+StateDirectory=gpu-thermal-guard
+# Don't let the OOM killer take the guard out
+OOMScoreAdjust=-900
+
+[Install]
+WantedBy=multi-user.target

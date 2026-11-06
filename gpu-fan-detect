@@ -1,0 +1,460 @@
+#!/usr/bin/python3
+"""Work out how to control the fans on this machine, and which fan is the GPU's.
+
+Run this first on a new machine. It is read-only unless you ask for a spin test.
+
+  gpu-fan-detect                  what controls the fans here, and a settings file to match
+  sudo gpu-fan-detect --spin      drive the configured target up and down, and show which
+                                  tachometers follow it (this is how you find the GPU fan)
+  sudo gpu-fan-detect --spin-all  do that for every header or zone in turn
+  gpu-fan-detect --write-config fan-curve.toml      write the suggested settings out
+
+A spin test changes fan speeds for about half a minute per target and puts the mode and
+duty back afterwards, including on Ctrl+C. Nothing else here writes anything.
+
+  --backend NAME   test this backend instead of the configured one (asrock, supermicro,
+                   hwmon, command)
+  --fan N          header (asrock), zone (supermicro) or pwm number (hwmon) to test
+  --low PCT        the low step of the sweep (default: the backend's minimum duty)
+  --dwell SECS     how long to hold each step before reading the tachs (default 12)
+"""
+import argparse
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+import tomllib
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+sys.path.append("/usr/local/lib/gpu-fan-control")
+import fan_backend                                                      # noqa: E402
+from fan_backend import (FanError, find_config, ipmi_device, make_backend, probe_bmc,  # noqa: E402
+                         probe_hwmon, probe_tool, probe_vendor_commands, probe_zones, sdr_fans)
+
+BOLD, DIM, OK, WARN, BAD, OFF = "\033[1m", "\033[2m", "\033[32m", "\033[33m", "\033[1;31m", "\033[0m"
+COLOR = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+
+
+def c(text, code):
+    return f"{code}{text}{OFF}" if COLOR else str(text)
+
+
+def head(title):
+    print(("\n" if head.seen else "") + c(title, BOLD))
+    print(c("-" * len(title), DIM))
+    head.seen = True
+
+
+head.seen = False
+
+
+def item(label, value, note=""):
+    print(f"  {label + ':':<18}{value}" + (c(f"  {note}", DIM) if note else ""))
+
+
+# ----------------------------------------------------------------------------------- probing
+def gpus():
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=index,name,temperature.gpu",
+                              "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=20, check=True).stdout
+    except Exception as e:
+        return None, str(e)
+    rows = [[f.strip() for f in line.split(",")] for line in out.strip().splitlines()]
+    return rows, None
+
+
+def probe(args):
+    """Print everything we can learn without writing. Returns a suggested settings dict."""
+    suggestion = {}
+
+    head("Tools")
+    for tool, why in (("ipmitool", "needed by the asrock and supermicro backends"),
+                      ("nvidia-smi", "needed always: it reads the GPU temperature")):
+        ok = probe_tool(tool)
+        item(tool, c("found", OK) if ok else c("MISSING", BAD), why)
+    if not probe_tool("nvidia-smi"):
+        print(c("\n  Install the NVIDIA driver before going further: with no nvidia-smi there is\n"
+                "  no GPU temperature to drive a fan from.", WARN))
+
+    head("GPUs")
+    rows, err = gpus()
+    if err:
+        item("nvidia-smi", c(f"failed ({err})", BAD))
+    else:
+        for idx, name, temp in rows:
+            item(f"GPU{idx}", f"{name}, {temp} C")
+        item("count", f"{len(rows)} (the hottest one drives the curve)")
+
+    head("BMC")
+    root, dev = os.geteuid() == 0, ipmi_device()
+    bmc = probe_bmc()
+    if not bmc["found"] and dev and not root:
+        # The node is mode 0600 root:root, and ipmitool reports that as "no such file".
+        item("ipmi device", f"{dev} exists", "so this board does have a BMC")
+        item("ipmitool mc info", c("needs root", WARN), "re-run with sudo to read it")
+        print(c(f"\n  {dev} is root-only, so nothing about the BMC can be probed as an ordinary\n"
+                "  user. Re-run this as: sudo gpu-fan-detect", WARN))
+    elif not bmc["found"]:
+        item("ipmi device", c("none", WARN) if not dev else dev)
+        item("ipmitool mc info", c("no BMC reachable", WARN), bmc["error"] or "")
+        print(c("\n  No BMC, or the IPMI kernel modules aren't loaded. If this board has one:\n"
+                "    sudo modprobe ipmi_devintf ipmi_si   (then re-run this)\n"
+                "  Otherwise use the hwmon backend below.", DIM))
+    else:
+        item("manufacturer", bmc["manufacturer"] or "?")
+        item("product", bmc["product"] or "?")
+        item("firmware", bmc["firmware"] or "?")
+
+    vendor = {}
+    if bmc["found"]:
+        head("OEM fan commands")
+        vendor = probe_vendor_commands()
+        for kind, (works, detail) in sorted(vendor.items()):
+            item(kind, c("answers", OK) if works else c("no", DIM), detail)
+        zones = probe_zones() if vendor.get("supermicro", (False,))[0] else {}
+        if zones:
+            item("supermicro zones", ", ".join(f"zone {z} at {d} %" for z, d in sorted(zones.items())),
+                 "zone 0 = FAN1..n, zone 1 = FANA/FANB")
+
+        head("Fan sensors (the BMC's own tachometers)")
+        try:
+            fans = sdr_fans()
+        except FanError as e:
+            fans = {}
+            item("ipmitool sdr", c(f"failed ({e})", BAD))
+        for name, rpm in fans.items():
+            spinning = rpm is not None and rpm > 0
+            item(name, c(f"{rpm} RPM", OK) if spinning else c("no reading", DIM),
+                 "" if spinning else "empty header, or a stopped fan")
+        if fans:
+            print(c("\n  The GPU fan is one of the ones that are spinning. --spin-all tells you which.", DIM))
+
+    head("hwmon (Super I/O chips, no BMC needed)")
+    chips = probe_hwmon()
+    if not chips:
+        item("hwmon", c("nothing with a fan or pwm", DIM), "try: sudo sensors-detect")
+    for ch in chips:
+        if not ch["pwms"] and not any(ch["fans"].values()):
+            continue
+        item(ch["chip"], (", ".join(ch["pwms"]) or "no pwm output") + " | "
+             + (", ".join(f"{k.replace('_input', '')} {v} RPM" for k, v in ch["fans"].items() if v)
+                or "no tach reading"),
+             os.path.basename(ch["path"]))
+    if any(ch["pwms"] for ch in chips) and (bmc["found"] or (dev and not root)):
+        print(c("\n  Careful: on a board whose headers are wired to the BMC, these pwm outputs exist\n"
+                "  but control nothing (and the tachs read 0). Prefer the BMC backend, and use\n"
+                "  --spin to prove whichever one you pick actually moves a fan.", WARN))
+
+    # ------------------------------------------------------------------ what to use
+    head("Suggested settings")
+    if vendor.get("supermicro", (False,))[0]:
+        zones = probe_zones()
+        try:
+            fans = sdr_fans()
+        except FanError:
+            fans = {}
+            lettered = []
+        lettered = [n for n, rpm in fans.items() if re.fullmatch(r"FAN[A-Z]", n.split()[0] if n else "")
+                    and rpm is not None]
+        zone = 1 if (1 in zones and lettered) else 0
+        suggestion = {"backend": "supermicro", "fan": zone, "min_duty": 30,
+                      "tach": lettered if zone == 1 else
+                      [n for n, rpm in fans.items() if re.fullmatch(r"FAN\d", n.split()[0] if n else "")
+                       and rpm is not None]}
+        print(f"  This is a Supermicro BMC. Duty is set per {c('zone', BOLD)}, not per header, so every\n"
+              f"  fan in the zone follows the curve - put the GPU fan in a zone of its own if you can\n"
+              f"  (the lettered headers FANA/FANB are zone 1, the numbered ones zone 0).")
+    elif vendor.get("asrock", (False,))[0]:
+        suggestion = {"backend": "asrock", "fan": 2, "min_duty": 20, "tach": []}
+        print("  This is an ASRock Rack BMC. Duty and mode are per header, so the other headers\n"
+              "  keep running on the BMC's own curve. Set fan to the header the GPU fan is on.")
+    elif dev and not root:
+        print(c("  Can't tell yet: the BMC is there but only root may talk to it.", WARN))
+        print(f"  Re-run as {c('sudo gpu-fan-detect', BOLD)} - the answer depends on which OEM\n"
+              "  fan commands it answers, and that needs the IPMI device.")
+    elif any(ch["pwms"] for ch in chips):
+        ch = next(c_ for c_ in chips if c_["pwms"])
+        suggestion = {"backend": "hwmon", "fan": int(re.sub(r"\D", "", ch["pwms"][0])),
+                      "min_duty": 20, "tach": [], "hwmon": {"chip": ch["chip"]}}
+        print(f"  No OEM fan commands answered, but {ch['chip']} offers {', '.join(ch['pwms'])}.\n"
+              "  Use the hwmon backend, and prove the pwm you pick really drives the fan with --spin.")
+    else:
+        print(c("  Nothing here can drive a fan: no OEM fan commands and no hwmon pwm output.", BAD))
+        print("  Options: load the IPMI modules (see above), or use the command backend with\n"
+              "  whatever your board's vendor documents. See examples/fan-curve.command.toml.")
+    if suggestion:
+        print(f"\n  Next: {c('sudo gpu-fan-detect --spin-all', BOLD)} to find which fan is the GPU's,")
+        print(f"        then {c('gpu-fan-detect --write-config fan-curve.toml', BOLD)} and edit the curve.")
+        print(c("\n  " + ", ".join(f"{k} = {v!r}" for k, v in suggestion.items() if k != "hwmon"), DIM))
+    return suggestion
+
+
+# -------------------------------------------------------------------------------- spin test
+def candidates(args, cfg):
+    """[(name, cfg)] for every target worth testing with --spin-all."""
+    out = []
+    kind = args.backend or cfg.get("backend", "asrock")
+    if kind == "asrock":
+        for n in range(1, 7):
+            out.append((f"FAN{n}", {**cfg, "backend": "asrock", "fan": n, "tach": []}))
+    elif kind == "supermicro":
+        for z in sorted(probe_zones()):
+            out.append((f"zone {z}", {**cfg, "backend": "supermicro", "fan": z, "tach": []}))
+    elif kind == "hwmon":
+        for ch in probe_hwmon():
+            for pwm in ch["pwms"]:
+                out.append((f"{ch['chip']} {pwm}",
+                            {**cfg, "backend": "hwmon", "fan": int(re.sub(r"\D", "", pwm)),
+                             "tach": [], "hwmon": {"chip": ch["chip"]}}))
+    else:
+        out.append(("configured target", cfg))
+    return out
+
+
+def all_rpms(backend):
+    """Every tach we can read, so we can see which one follows the target we are driving."""
+    if backend.kind in ("asrock", "supermicro"):
+        try:
+            return {k: v for k, v in sdr_fans().items()}
+        except FanError:
+            return {}
+    if backend.kind == "hwmon":
+        out = {}
+        for ch in probe_hwmon():
+            for name, rpm in ch["fans"].items():
+                out[f"{ch['chip']}/{name.replace('_input', '')}"] = rpm
+        return out
+    try:
+        return backend.rpms()
+    except FanError:
+        return {}
+
+
+def spin_one(name, cfg, args):
+    """Drive one target high then low, and report which tachs followed. Always restores."""
+    backend = make_backend(cfg)
+    low = args.low if args.low is not None else backend.min_duty
+    low = max(backend.min_duty, min(backend.max_duty, low))
+    high = backend.max_duty
+    print(f"\n{c(f'Testing {name}', BOLD)} ({backend.kind}, {low}-{high} %)")
+    try:
+        was_mode, mode_text, ours = backend.mode()
+        was_duty = backend.live_duty()
+    except FanError as e:
+        print(c(f"  can't read it: {e}", BAD))
+        return None
+    print(c(f"  before: {mode_text}, duty {was_duty} %", DIM))
+    readings = {}
+    try:
+        for label, duty in (("high", high), ("low", low)):
+            backend.drive(duty)
+            for remaining in range(int(args.dwell), 0, -1):
+                print(f"\r  {label} {duty} %: settling, {remaining:2d} s ", end="", flush=True)
+                time.sleep(1)
+            readings[label] = all_rpms(backend)
+            print(f"\r  {label} {duty} %: " + (", ".join(
+                f"{k} {'-' if v is None else v}" for k, v in readings[label].items()) or "no tachs") + "    ")
+    except KeyboardInterrupt:
+        print(c("\n  interrupted", WARN))
+    finally:
+        try:
+            if was_duty is not None and ours:
+                backend.set_duty(was_duty)      # it was already ours: put the duty back too
+            backend.release()
+            print(c(f"  restored: {mode_text}", DIM))
+        except FanError as e:
+            print(c(f"  COULD NOT RESTORE {name}: {e}", BAD))
+            print(c("  Put it back by hand, or start gpu-fan-control, before leaving the machine.", BAD))
+    if len(readings) < 2:
+        return None
+    moved = {}
+    for sensor, hi in readings["high"].items():
+        lo = readings["low"].get(sensor)
+        if hi and lo and abs(hi - lo) >= max(150, 0.1 * hi):
+            moved[sensor] = (lo, hi)
+    if moved:
+        print("  " + c("follows this target:", OK) + " " + ", ".join(
+            f"{c(s, BOLD)} ({lo} -> {hi} RPM)" for s, (lo, hi) in moved.items()))
+    else:
+        print("  " + c("nothing followed it", DIM) + " - not this target, or the fan ignores PWM "
+              "(a 3-pin fan runs flat out)")
+    return moved
+
+
+def spin(args, cfg):
+    if os.geteuid() != 0:
+        sys.exit("A spin test writes fan settings: run it with sudo")
+    targets = candidates(args, cfg) if args.spin_all else [("the configured target", cfg)]
+    if args.backend and not args.spin_all:
+        targets = [(f"{args.backend} {args.fan if args.fan is not None else ''}".strip(),
+                    {**cfg, "backend": args.backend,
+                     **({"fan": args.fan} if args.fan is not None else {})})]
+    elif args.fan is not None and not args.spin_all:
+        targets = [(f"fan {args.fan}", {**cfg, "fan": args.fan})]
+    secs = len(targets) * 2 * int(args.dwell)
+    print(c(f"About to change fan speeds on {len(targets)} target(s), roughly "
+            f"{secs // 60} min {secs % 60} s in total.", WARN))
+    print("Each one is driven to full, then to its minimum, then put back as it was.")
+    if not args.yes:
+        print("Ctrl+C aborts. Starting in 5 s ", end="", flush=True)
+        try:
+            for _ in range(5):
+                time.sleep(1)
+                print(".", end="", flush=True)
+            print()
+        except KeyboardInterrupt:
+            sys.exit("\naborted")
+    found = {}
+    for name, target_cfg in targets:
+        try:
+            moved = spin_one(name, target_cfg, args)
+        except (ValueError, FanError) as e:
+            print(f"\n{c(f'Testing {name}', BOLD)}: {c(f'skipped ({e})', DIM)}")
+            continue
+        if moved:
+            found[name] = moved
+    head("Spin test result")
+    if not found:
+        print("  No tach followed any target. Either the fan ignores PWM (3-pin fans do), or\n"
+              "  this backend doesn't reach the headers, or the sweep was too short (--dwell).")
+    for name, moved in found.items():
+        print(f"  {c(name, BOLD)} drives " + ", ".join(
+            f"{s} ({lo}-{hi} RPM)" for s, (lo, hi) in moved.items()))
+    if found:
+        best = next(iter(found))
+        print(c(f"\n  The GPU fan is whichever of those changed speed - listen to the machine, or\n"
+                f"  watch the GPU temperature. Put that target in fan-curve.toml ({best} above),\n"
+                f"  along with its tach name so a stalled fan is noticed.", DIM))
+
+
+# ----------------------------------------------------------------------------- config writer
+TEMPLATE = '''# GPU-driven fan control settings, read by gpu-fan-control.service.
+# Written by gpu-fan-detect on {host} ({when}) - check every line before trusting it.
+# Saved changes are picked up automatically on the next check (no restart needed).
+# If the file has an error, the service logs it and keeps the last good settings:
+#   sudo journalctl -fu gpu-fan-control
+
+# How the duty reaches the fan: asrock | supermicro | hwmon | command
+backend = "{backend}"
+
+{fan_comment}
+fan = {fan}
+{extra}
+# Seconds between GPU temperature checks.
+interval = 5
+
+# Duty (%) used when the GPU temperature can't be read.
+failsafe_duty = 100
+
+# The lowest duty this board and fan are happy with. Below the floor the fan can stall,
+# and on a Supermicro BMC a tach under its lower critical threshold makes the BMC blast
+# every fan to full. Prove a lower floor with: sudo gpu-fan-detect --spin --low {min_duty}
+min_duty = {min_duty}
+
+# Fan curve: [GPU temp in C, duty in %] points, linearly interpolated between them.
+# Below the first point uses its duty; above the last point uses its duty.
+# Values outside min_duty..100 are clamped. RETUNE THIS on new hardware: run a load test
+# and check the hottest GPU stays well under its max operating temperature.
+curve = [
+  [40, {min_duty}],
+  [50, 35],
+  [60, 50],
+  [70, 75],
+  [78, 100],
+]
+
+# Ramp-down after load drops (ramp-up is always immediate):
+# keep the current duty this many seconds after the GPU cools, to clear residual heat...
+hold_secs = 60
+# ...treating demand within this many % of the current duty as still loaded (temp jitter)...
+hold_band = 10
+# ...then lower the duty by at most this many % per check.
+step_down = 2
+
+# Fan failure detection: if a watched tach reads below this many RPM for 3 checks while
+# the fan is being driven, log a FAN FAULT (journalctl -p crit) and hold the fan at 100 %
+# until it reads OK again. 0 turns it off.
+fan_min_rpm = 300
+
+# Which tachometer(s) to watch. Empty means the backend guesses: the matching header for
+# ASRock, every populated header of the zone for Supermicro. Names come from
+# `ipmitool sdr type Fan` (gpu-fan-detect lists them).
+tach = {tach}
+'''
+
+FAN_COMMENTS = {
+    "asrock": "# The BMC fan header to drive (1-6). The other headers stay on the BMC's own curve.",
+    "supermicro": ("# The fan ZONE to drive: 0 = the numbered headers (FAN1..FAN5), 1 = the lettered\n"
+                   "# ones (FANA, FANB). Every fan in the zone follows the curve - Supermicro BMCs\n"
+                   "# cannot set one header on its own. `zone = 1` is accepted as a clearer alias."),
+    "hwmon": "# Which pwm output to drive: 2 means pwm2 on the chip named below.",
+    "command": "# Unused by the command backend, but keep it: it names the target in logs.",
+}
+
+
+def write_config(path, suggestion, cfg):
+    import socket
+    backend = suggestion.get("backend") or cfg.get("backend", "asrock")
+    fan = suggestion.get("fan", cfg.get("fan", 2))
+    extra = ""
+    if backend == "hwmon":
+        chip = suggestion.get("hwmon", {}).get("chip", "nct6798")
+        extra = (f'\n# The hwmon chip the pwm output belongs to (as `sensors` names it).\n'
+                 f'[hwmon]\nchip = "{chip}"\n')
+    elif backend == "command":
+        extra = ('\n[command]\n# {duty} is replaced with the percentage. Run without a shell:\n'
+                 '# no pipes, no redirection, no $VARS.\ntake_over = ""\nset_duty = ""\nrelease = ""\n')
+    text = TEMPLATE.format(
+        host=socket.gethostname(), when=time.strftime("%Y-%m-%d %H:%M"),
+        backend=backend, fan=fan, fan_comment=FAN_COMMENTS.get(backend, ""),
+        min_duty=suggestion.get("min_duty", 20), extra=extra,
+        tach="[" + ", ".join(f'"{t}"' for t in suggestion.get("tach", [])) + "]")
+    if os.path.exists(path):
+        sys.exit(f"{path} already exists: move it aside first (it may be a tuned curve)")
+    with open(path, "w") as f:
+        f.write(text)
+    print(f"\nWrote {path}")
+    print("Check it, set the curve to something sane for your hardware, then:")
+    print("  gpu-fan-control --config " + path + " --check")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Find out how to control the fans on this machine.",
+                                 epilog="Read-only unless --spin or --spin-all is given.")
+    ap.add_argument("--config", default=None, help="settings file to read the target from")
+    ap.add_argument("--spin", action="store_true", help="drive the configured target up and down")
+    ap.add_argument("--spin-all", action="store_true", help="do that for every header or zone")
+    ap.add_argument("--backend", choices=sorted(fan_backend.BACKENDS), help="test this backend")
+    ap.add_argument("--fan", type=int, help="header, zone or pwm number to test")
+    ap.add_argument("--low", type=int, help="low step of the sweep (default: the backend minimum)")
+    ap.add_argument("--dwell", type=float, default=12, help="seconds to hold each step (default 12)")
+    ap.add_argument("--yes", action="store_true", help="don't wait before starting a spin test")
+    ap.add_argument("--write-config", metavar="PATH", help="write the suggested settings to PATH")
+    ap.add_argument("--version", action="version",
+                    version=f"%(prog)s {fan_backend.VERSION}")
+    args = ap.parse_args()
+
+    path = args.config or find_config("fan-curve.toml", __file__)
+    cfg = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "rb") as f:
+                cfg = tomllib.load(f)
+            if "zone" in cfg:
+                cfg["fan"] = cfg.pop("zone")
+        except Exception as e:
+            print(c(f"Note: {path} can't be read ({e}); using built-in defaults", WARN))
+    cfg.setdefault("fan", 2)
+
+    if args.spin or args.spin_all:
+        return spin(args, cfg)
+    suggestion = probe(args)
+    if args.write_config:
+        write_config(args.write_config, suggestion, cfg)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,304 @@
+#!/usr/bin/python3
+"""Last line of defence against GPU overheating (e.g. the shared fan died).
+
+Watches every GPU with nvidia-smi only (no IPMI, so a hung BMC can't stall it):
+
+  warn_temp (80 C)  log a warning and cap every GPU at its minimum power limit.
+                    The cap is lifted (previous limits restored) once every GPU has
+                    stayed below release_temp for release_secs.
+  trip_temp (85 C)  log CRITICAL, wall a message, SIGTERM every process using a GPU,
+                    SIGKILL whatever is left after kill_grace seconds. Then stay
+                    LATCHED: GPUs stay capped and any new GPU process is killed,
+                    until a manual reset (the cause, e.g. a dead fan, is probably
+                    still there). The latch survives restarts and reboots.
+
+  gpu-thermal-guard [--config PATH]        run the guard (the service does this)
+  gpu-thermal-guard --status               show the guard state
+  sudo gpu-thermal-guard --reset           clear a trip (the service restores the limits)
+
+The GPUs themselves still slow down at 88 C and shut down at 91 C.
+"""
+import argparse
+import datetime
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+import tomllib
+
+STATE = "/var/lib/gpu-thermal-guard/state.json"
+DEFAULTS = {"interval": 2, "warn_temp": 80, "release_temp": 75, "release_secs": 60,
+            "trip_temp": 85, "kill_grace": 10}
+
+
+def find_config(name):
+    """The settings file to use: GPU_FAN_CONFIG_DIR, then the folder this script sits in,
+    then the folder install.sh recorded in /etc/gpu-fan-control.conf (so an installed copy
+    in /usr/local/bin finds the settings wherever the package was unpacked), then
+    /etc/gpu-fan-control. Deliberately a local copy rather than an import from
+    fan_backend: this program depends on nothing but nvidia-smi."""
+    dirs = [os.environ.get("GPU_FAN_CONFIG_DIR"), os.path.dirname(os.path.realpath(__file__))]
+    try:
+        with open("/etc/gpu-fan-control.conf") as f:
+            dirs += [line.partition("=")[2].strip().strip("\"'") for line in f
+                     if line.startswith("CONFIG_DIR=")]
+    except OSError:
+        pass
+    dirs.append("/etc/gpu-fan-control")
+    for d in dirs:
+        if d and os.path.exists(os.path.join(d, name)):
+            return os.path.join(d, name)
+    return os.path.join(dirs[-1], name)
+
+
+def log(msg, prio=None):
+    """prio: syslog level (2 = crit, 4 = warning, 5 = notice), shown by journalctl -p."""
+    print(f"<{prio}>{msg}" if prio is not None else msg, flush=True)
+
+
+def now_iso():
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def load_config(path):
+    cfg = dict(DEFAULTS)
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            cfg.update(tomllib.load(f))
+    if unknown := set(cfg) - set(DEFAULTS):
+        raise ValueError(f"unknown setting(s): {', '.join(sorted(unknown))}")
+    for k, v in cfg.items():
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
+            raise ValueError(f"{k} must be a number > 0")
+    if not cfg["release_temp"] < cfg["warn_temp"] <= cfg["trip_temp"]:
+        raise ValueError("need release_temp < warn_temp <= trip_temp")
+    return cfg
+
+
+def smi(*args, timeout=20):
+    return subprocess.run(["nvidia-smi", *args], capture_output=True, text=True,
+                          timeout=timeout, check=True).stdout
+
+
+def gpus():
+    """{index: {temp, limit, min}}; temp is None if unreadable."""
+    out = smi("--query-gpu=index,temperature.gpu,power.limit,power.min_limit",
+              "--format=csv,noheader,nounits")
+    res = {}
+    for line in out.strip().splitlines():
+        idx, temp, limit, lo = (f.strip() for f in line.split(","))
+        res[idx] = {"temp": int(temp) if temp.isdigit() else None,
+                    "limit": float(limit), "min": float(lo)}
+    return res
+
+
+def gpu_pids():
+    """{pid: description} of every compute process on any GPU."""
+    out = smi("--query-compute-apps=pid,process_name,gpu_bus_id", "--format=csv,noheader")
+    pids = {}
+    for line in out.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if parts and parts[0].isdigit():
+            pids[int(parts[0])] = f"{parts[1]} on {parts[2]}" if len(parts) >= 3 else line
+    pids.pop(os.getpid(), None)
+    return {p: d for p, d in pids.items() if p > 1}
+
+
+def set_limit(idx, watts):
+    smi("-i", idx, "-pl", f"{watts:.0f}")
+
+
+def wall(msg):
+    try:
+        subprocess.run(["wall", msg], timeout=10)
+    except Exception:
+        pass
+
+
+def read_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {"stage": "normal"}
+
+
+def write_state(state):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=1)
+    os.replace(tmp, STATE)
+
+
+class Guard:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.state = read_state()           # stage: normal | capped | tripped
+        self.cool_since = None              # all GPUs below release_temp since (monotonic)
+        self.killing = {}                   # pid -> SIGKILL deadline (monotonic)
+        self.err = None
+        if self.state["stage"] != "normal":
+            log(f"Resuming in stage {self.state['stage'].upper()} "
+                f"(since {self.state.get('since')}: {self.state.get('reason')})",
+                prio=2 if self.state["stage"] == "tripped" else 4)
+
+    def set_stage(self, stage, reason, g=None):
+        if stage != "normal" and self.state["stage"] == "normal":
+            # remember the limits to restore later (gpu-power-limit's cool mode, etc.)
+            self.state["saved_limits"] = {i: v["limit"] for i, v in g.items()}
+        self.state.update(stage=stage, since=now_iso(), reason=reason)
+        if stage == "normal":
+            self.state = {"stage": "normal"}
+        write_state(self.state)
+
+    def cap(self, g):
+        for i, v in g.items():
+            if v["limit"] > v["min"]:
+                try:
+                    set_limit(i, v["min"])
+                    log(f"GPU{i} power capped {v['limit']:.0f} -> {v['min']:.0f} W", prio=4)
+                except Exception as e:
+                    log(f"GPU{i}: can't set power limit: {e}", prio=3)
+
+    def restore_limits(self):
+        for i, w in self.state.get("saved_limits", {}).items():
+            try:
+                set_limit(i, w)
+                log(f"GPU{i} power limit restored to {w:.0f} W", prio=5)
+            except Exception as e:
+                log(f"GPU{i}: can't restore power limit {w:.0f} W: {e}", prio=3)
+
+    def kill_gpu_processes(self):
+        try:
+            pids = gpu_pids()
+        except Exception as e:
+            log(f"Can't list GPU processes: {e}", prio=3)
+            return
+        t = time.monotonic()
+        for pid, desc in pids.items():
+            if pid in self.killing:
+                continue
+            try:
+                os.kill(pid, signal.SIGTERM)
+                log(f"SIGTERM pid {pid} ({desc})", prio=2)
+                self.killing[pid] = t + self.cfg["kill_grace"]
+            except ProcessLookupError:
+                pass
+            except Exception as e:
+                log(f"Can't signal pid {pid} ({desc}): {e}", prio=2)
+        for pid, deadline in list(self.killing.items()):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                del self.killing[pid]
+                continue
+            if t >= deadline:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                    log(f"SIGKILL pid {pid} (still running {self.cfg['kill_grace']} s after SIGTERM)", prio=2)
+                except ProcessLookupError:
+                    pass
+                del self.killing[pid]
+
+    def step(self):
+        stage = self.state["stage"]
+        if stage == "tripped" and not os.path.exists(STATE):
+            log("Trip reset by operator; lifting the power cap", prio=5)
+            self.state["stage"] = "capped"      # restore below, then normal
+            self.restore_limits()
+            self.set_stage("normal", "reset")
+            self.killing.clear()
+            return
+        try:
+            g = gpus()
+            self.err = None
+        except Exception as e:
+            if str(e) != self.err:
+                self.err = str(e)
+                log(f"Can't read GPUs ({e}); guard is blind until nvidia-smi works", prio=3)
+            if stage == "tripped":
+                self.kill_gpu_processes()
+            return
+        temps = {i: v["temp"] for i, v in g.items() if v["temp"] is not None}
+        hot = max(temps.values(), default=None)
+        desc = ", ".join(f"GPU{i} {t}C" for i, t in sorted(temps.items()))
+        if hot is not None and hot >= self.cfg["trip_temp"] and stage != "tripped":
+            reason = f"{desc} reached trip temperature {self.cfg['trip_temp']}C"
+            log(f"THERMAL TRIP: {reason}; killing all GPU processes and latching", prio=2)
+            wall(f"gpu-thermal-guard: THERMAL TRIP ({desc}). Killing all GPU processes. "
+                 f"GPUs stay power-capped until: sudo gpu-thermal-guard --reset")
+            self.set_stage("tripped", reason, g)
+            stage = "tripped"
+        elif hot is not None and hot >= self.cfg["warn_temp"] and stage == "normal":
+            reason = f"{desc} reached warning temperature {self.cfg['warn_temp']}C"
+            log(f"THERMAL WARNING: {reason}; capping GPU power", prio=4)
+            self.set_stage("capped", reason, g)
+            stage = "capped"
+        if stage == "tripped":
+            self.cap(g)
+            self.kill_gpu_processes()
+        elif stage == "capped":
+            self.cap(g)
+            if len(temps) == len(g) and hot < self.cfg["release_temp"]:
+                self.cool_since = self.cool_since or time.monotonic()
+                if time.monotonic() - self.cool_since >= self.cfg["release_secs"]:
+                    log(f"Cooled down ({desc}); lifting the power cap", prio=5)
+                    self.restore_limits()
+                    self.set_stage("normal", "cooled")
+                    self.cool_since = None
+            else:
+                self.cool_since = None
+
+
+def status():
+    s = read_state()
+    print(f"Thermal guard: {s['stage'].upper()}")
+    if s["stage"] != "normal":
+        print(f"  since:  {s.get('since')}\n  reason: {s.get('reason')}")
+        if lim := s.get("saved_limits"):
+            print("  limits to restore: " + ", ".join(f"GPU{i} {w:.0f} W" for i, w in lim.items()))
+    if s["stage"] == "tripped":
+        print("  clear with: sudo gpu-thermal-guard --reset")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Cap or kill GPU work if the GPUs overheat.")
+    ap.add_argument("--config", default=None, help="settings file (TOML, optional)")
+    ap.add_argument("--status", action="store_true", help="show the guard state and exit")
+    ap.add_argument("--reset", action="store_true", help="clear a thermal trip and exit")
+    args = ap.parse_args()
+    args.config = args.config or find_config("thermal-guard.toml")
+    if args.status:
+        return status()
+    if args.reset:
+        if read_state()["stage"] != "tripped":
+            print("Not tripped; nothing to reset")
+            return
+        try:
+            os.remove(STATE)    # the running guard sees this, restores limits, goes normal
+        except PermissionError:
+            sys.exit("Reset needs root: sudo gpu-thermal-guard --reset")
+        print("Trip cleared; the guard restores the power limits within a few seconds")
+        return
+    try:
+        cfg = load_config(args.config)
+    except Exception as e:
+        log(f"Config error in {args.config} ({e}); using built-in defaults", prio=3)
+        cfg = dict(DEFAULTS)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    log(f"Guarding all GPUs: warn {cfg['warn_temp']}C (power cap), trip {cfg['trip_temp']}C "
+        f"(kill GPU processes, latch), check every {cfg['interval']} s")
+    guard = Guard(cfg)
+    while True:
+        try:
+            guard.step()
+        except Exception as e:      # never let one bad step stop the guard
+            log(f"Guard error: {e}", prio=3)
+        time.sleep(cfg["interval"])
+
+
+if __name__ == "__main__":
+    main()

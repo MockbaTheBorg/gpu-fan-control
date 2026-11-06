@@ -1,0 +1,10 @@
+# Settings for gpu-power-limit (and gpu-power-limit.service, which applies cool mode at boot).
+# Read every time gpu-power-limit runs; the service re-reads it on restart.
+#   sudo gpu-power-limit          show the limit, the allowed range and the current draw
+#   sudo gpu-power-limit cool     apply the limit below
+#   sudo gpu-power-limit full     back to the GPU's own default limit
+
+# Watts to cap each GPU at in cool mode. Must be inside the range nvidia-smi reports as
+# allowed for the card (`gpu-power-limit` prints it); a Tesla V100 allows 100-250 W.
+# 150 W on a V100 settles at ~68 C instead of ~77 C, with much less fan noise.
+cool_watts = 150

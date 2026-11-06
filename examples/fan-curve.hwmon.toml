@@ -1,0 +1,55 @@
+# Settings for a board with no BMC, driving a fan header through the Super I/O chip the
+# way fancontrol and CoolerControl do: Linux hwmon sysfs.
+#
+#   sudo gpu-fan-detect              list the hwmon chips, their pwm outputs and tachs
+#   sudo gpu-fan-detect --spin-all   find which pwm output actually moves the GPU fan
+#
+# Two things to know before trusting this backend:
+#   * A pwm output existing does not mean it is wired to anything. On boards whose headers
+#     go to a BMC, the Super I/O driver still offers pwm1..7 and none of them do anything.
+#     The spin test is the only honest check: a real output changes a tach reading.
+#   * Nothing stops two programs fighting over the same pwm. If fancontrol, CoolerControl,
+#     thermald or a vendor daemon is running, stop and disable it first.
+
+backend = "hwmon"
+
+# Which pwm output: 2 means pwm2 on the chip named below. Prove it with --spin-all.
+fan = 2
+# The tach to watch, as a path or a bare filename next to the pwm. Empty means fanN_input
+# matching the pwm number, which is right on most chips but not all - check with --spin.
+tach = ["fan2_input"]
+
+interval = 5
+failsafe_duty = 100
+
+# A Super I/O pwm takes 0-255; this is a percentage of it. Most 4-pin fans stop somewhere
+# between 10 and 20 %, and a stopped fan that still reads 0 RPM looks like a fault.
+min_duty = 20
+
+# RETUNE THIS for your own fan, duct and case. See fan-curve.supermicro.toml for how.
+curve = [
+  [40, 20],
+  [50, 35],
+  [60, 50],
+  [70, 75],
+  [78, 100],
+]
+
+hold_secs = 60
+hold_band = 10
+step_down = 2
+fan_min_rpm = 300
+
+# Tables go last in TOML: every key below this line belongs to [hwmon].
+[hwmon]
+# The chip that owns the pwm output, as `sensors` and gpu-fan-detect name it.
+chip = "nct6798"
+# Or point straight at the file and leave `chip` out - but note that hwmonN numbering can
+# change across reboots, which is why naming the chip is the safer way round:
+# pwm = "/sys/class/hwmon/hwmon0/pwm2"
+#
+# What to write to pwmN_enable to take manual control. 1 on nearly every driver.
+# manual_value = 1
+# What to write back when handing the fan over on exit. Unset means "whatever it was when
+# the service started", falling back to 2 (the chip's own automatic control).
+# restore_value = 2

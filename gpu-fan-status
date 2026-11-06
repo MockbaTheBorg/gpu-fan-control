@@ -1,0 +1,382 @@
+#!/usr/bin/python3
+"""Show GPU temperature and the GPU fan's speed. Read-only: never changes any fan setting.
+Shows every GPU; the curve target follows the hottest one, as the service does.
+
+  gpu-fan-status            one reading, as text
+  gpu-fan-status -w [SECS]  the live view: a screen of its own, refreshed every SECS
+                            seconds (default 2), with graphs of the last minutes
+  gpu-fan-status -w --plain the old plain-text refresh instead
+  watch -c -n 2 gpu-fan-status --color   one reading under watch (needs -c and --color)
+
+The live view needs Textual; it comes from .venv next to this script (setup below) and
+the script re-runs itself there. Without it, -w falls back to the plain-text refresh.
+
+Values are colour coded green / yellow / red. Colour is on when the output is a
+terminal; --color forces it on (for watch -c), --color=never or NO_COLOR turns it off.
+
+GPU data comes from nvidia-smi. Fan RPM, live duty and mode come from whichever backend
+fan-curve.toml selects (read-only calls only); the BMC backends need root, so run it with
+sudo for those. Without root it falls back to the last duty logged by
+gpu-fan-control.service.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import tomllib
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+sys.path.append("/usr/local/lib/gpu-fan-control")
+import fan_backend                                                  # noqa: E402
+
+VERSION = fan_backend.VERSION
+CONFIG = fan_backend.find_config("fan-curve.toml", __file__)
+GUARD_STATE = "/var/lib/gpu-thermal-guard/state.json"
+
+# Colour thresholds. V100 limits: max operating 83 C, slowdown 88 C, shutdown 91 C.
+TEMP_WARN, TEMP_HOT = 70, 80        # C
+DUTY_WARN, DUTY_HIGH = 50, 80       # % fan duty
+POWER_WARN = 0.95                   # draw as a fraction of the power limit
+
+# nvidia-smi clocks_event_reasons.active bits: (name, explanation, severity)
+# severity: ok = not a slowdown, warn = expected / mild, bad = protective slowdown
+REASONS = [
+    (0x001, "idle", "GPU is idle", "ok"),
+    (0x002, "app clocks", "application clocks setting", "warn"),
+    (0x004, "power cap", "at the power limit (SW power cap)", "warn"),
+    (0x008, "HW slowdown", "hardware slowdown (temp or power brake)", "bad"),
+    (0x010, "sync boost", "held to another GPU's clocks (sync boost)", "ok"),
+    (0x020, "SW thermal", "software thermal slowdown (above max operating temp)", "bad"),
+    (0x040, "HW thermal", "hardware thermal slowdown (GPU too hot)", "bad"),
+    (0x080, "power brake", "hardware power brake (external power signal)", "bad"),
+    (0x100, "display clocks", "display clock setting", "ok"),
+]
+
+COLOR = False
+SGR = {"ok": "32", "warn": "33", "bad": "1;31", "dim": "2", "bold": "1"}
+
+
+def c(text, level):
+    """Wrap text in an ANSI colour for level ok/warn/bad/dim/bold."""
+    return f"\033[{SGR[level]}m{text}\033[0m" if COLOR and level in SGR else str(text)
+
+
+def level(value, warn, bad):
+    return "bad" if value >= bad else "warn" if value >= warn else "ok"
+
+
+def row(label, value):
+    return f"{label + ':':<15}{value}"
+
+
+def run(cmd, timeout=15):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=True).stdout
+
+
+def settings():
+    """The settings file as a dict, or {} when it can't be read."""
+    try:
+        with open(CONFIG, "rb") as f:
+            cfg = tomllib.load(f)
+    except Exception:
+        return {}
+    if "zone" in cfg:
+        cfg.setdefault("fan", cfg.pop("zone"))
+    cfg.setdefault("fan", 2)
+    return cfg
+
+
+_BACKEND = None
+
+
+def backend():
+    """The configured backend, built once. Raises if the settings don't describe one."""
+    global _BACKEND
+    if _BACKEND is None:
+        _BACKEND = fan_backend.make_backend(settings())
+    return _BACKEND
+
+
+def fan_label():
+    """What the controlled fan is called, e.g. "FAN2" or "zone 1"."""
+    try:
+        return backend().label
+    except Exception:
+        return f"fan {settings().get('fan', 2)}"
+
+
+def duty_limits():
+    try:
+        b = backend()
+        return b.min_duty, b.max_duty
+    except Exception:
+        return 20, 100
+
+
+def fan_snapshot():
+    """What the backend can tell us about the fan right now, without writing anything.
+
+    Never raises: a failure is reported in the snapshot, because this is also what the
+    live view's sampler thread calls."""
+    snap = {"mode": None, "mode_text": "needs sudo", "mode_ok": False,
+            "duty": None, "duty_src": "", "rpms": {}, "err": None}
+    try:
+        b = backend()
+    except Exception as e:
+        snap["err"] = f"settings error ({e})"
+        return snap
+    try:
+        snap["mode"], snap["mode_text"], snap["mode_ok"] = b.mode()
+    except Exception as e:
+        snap["err"] = f"fan read failed ({e})"
+        return snap
+    try:
+        duty = b.live_duty()
+        if duty is not None:
+            snap.update(duty=duty, duty_src="live, from the board")
+    except Exception as e:
+        snap["err"] = f"duty read failed ({e})"
+    try:
+        snap["rpms"] = b.rpms()
+    except Exception as e:
+        snap["err"] = snap["err"] or f"tach read failed ({e})"
+    return snap
+
+
+def fan_curve():
+    """The [temp, duty] points from the config, or None when they can't be read."""
+    try:
+        with open(CONFIG, "rb") as f:
+            curve = tomllib.load(f).get("curve")
+    except Exception:
+        return None
+    return curve or None
+
+
+def curve_duty(temp):
+    """Duty the configured curve asks for at this temperature (before hold/ramp-down)."""
+    curve = fan_curve()
+    if not curve:
+        return None
+    lo, hi = duty_limits()
+    if temp <= curve[0][0]:
+        d = curve[0][1]
+    elif temp >= curve[-1][0]:
+        d = curve[-1][1]
+    else:
+        for (t0, d0), (t1, d1) in zip(curve, curve[1:]):
+            if temp <= t1:
+                d = d0 + (d1 - d0) * (temp - t0) / (t1 - t0)
+                break
+    return min(hi, max(lo, round(d)))
+
+
+def gpus():
+    fields = ("index,name,temperature.gpu,power.draw,power.limit,utilization.gpu,"
+              "clocks.sm,clocks.max.sm,clocks_event_reasons.active")
+    out = run(["nvidia-smi", f"--query-gpu={fields}", "--format=csv,noheader,nounits"], timeout=20)
+    keys = fields.split(",")
+    return [dict(zip(keys, (f.strip() for f in line.split(","))))
+            for line in out.strip().splitlines()]
+
+
+def num(text):
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def throttle(mask_text):
+    """(summary, severity) for a clocks_event_reasons.active bitmask like 0x0000000000000004."""
+    try:
+        mask = int(mask_text, 16)
+    except ValueError:
+        return f"unknown ({mask_text})", "dim"
+    hits = [(name, why, sev) for bit, name, why, sev in REASONS if mask & bit]
+    unknown = mask & ~sum(bit for bit, *_ in REASONS)
+    if unknown:
+        hits.append((f"0x{unknown:x}", f"unrecognised reason bits 0x{unknown:x}", "warn"))
+    slowing = [h for h in hits if h[2] != "ok"]
+    if not slowing:
+        return ("no (" + ", ".join(h[1] for h in hits) + ")" if hits else "no"), "ok"
+    sev = "bad" if any(h[2] == "bad" for h in slowing) else "warn"
+    return "YES: " + "; ".join(h[1] for h in slowing), sev
+
+
+def last_logged_duty(label=None):
+    """The last duty gpu-fan-control logged, for when we can't read the board ourselves."""
+    label = label if label is not None else fan_label()
+    try:
+        out = run(["journalctl", "-u", "gpu-fan-control", "-n", "50", "--no-pager", "-o", "short-iso"])
+    except Exception:
+        return None
+    for line in reversed(out.splitlines()):
+        m = re.search(rf"^(\S+).*-> {re.escape(label)} (\d+)%", line)
+        if m:
+            return f"{m.group(2)}% (set {m.group(1)}, from service log)"
+    return None
+
+
+def guard_data():
+    """gpu-thermal-guard's service state and latch: {svc, stage, since, reason} (stage "?" when unreadable)."""
+    svc = service_state("gpu-thermal-guard")
+    try:
+        with open(GUARD_STATE) as f:
+            st = json.load(f)
+    except FileNotFoundError:
+        st = {"stage": "normal"}
+    except Exception as e:
+        st = {"stage": "?", "reason": f"state unreadable ({e})"}
+    return {"svc": svc, "stage": st.get("stage", "?"), "since": st.get("since"), "reason": st.get("reason")}
+
+
+def guard_state():
+    """gpu-thermal-guard service + latch state, e.g. 'active, normal' or 'active, TRIPPED ...'."""
+    g = guard_data()
+    svc, st, stage = g["svc"], g, g["stage"]
+    text = f"{c(svc, 'ok' if svc == 'active' else 'bad')}, " + {
+        "normal": c("normal", "ok"),
+        "capped": c(f"POWER CAPPED since {st.get('since')}", "warn"),
+        "tripped": c(f"TRIPPED since {st.get('since')} (sudo gpu-thermal-guard --reset)", "bad"),
+    }.get(stage, c(st.get("reason") or stage, "warn"))
+    if stage != "normal" and st.get("reason"):
+        text += "\n" + " " * 15 + c(st["reason"], "dim")
+    return text
+
+
+def service_state(unit="gpu-fan-control"):
+    try:
+        return run(["systemctl", "is-active", unit]).strip()
+    except subprocess.CalledProcessError as e:
+        return e.stdout.strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def report():
+    fan = fan_label()
+    lines = [c(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ·  gpu-fan-status v{VERSION}", "dim")]
+    try:
+        hottest, unreadable, total_power = None, False, 0.0   # hottest = (temp, gpu index)
+        rows = gpus()
+        for g in rows:
+            temp, power, limit = num(g["temperature.gpu"]), num(g["power.draw"]), num(g["power.limit"])
+            sm, sm_max = num(g["clocks.sm"]), num(g["clocks.max.sm"])
+            lines.append(c(f"GPU{g['index']} {g['name']}", "bold"))
+            lines.append(row("  Temperature", c(f"{g['temperature.gpu']} C", level(temp, TEMP_WARN, TEMP_HOT))
+                             if temp is not None else c(g["temperature.gpu"], "bad")))
+            total_power += power or 0
+            if power is not None and limit:
+                p = c(f"{power:.0f} W", "warn" if power >= POWER_WARN * limit else "ok")
+                lines.append(row("  Power", f"{p} of {limit:.0f} W limit"))
+            else:
+                lines.append(row("  Power", f"{g['power.draw']} W (limit {g['power.limit']} W)"))
+            lines.append(row("  Utilization", f"{g['utilization.gpu']} %"))
+            if sm is not None and sm_max:
+                lines.append(row("  SM clock", f"{sm:.0f} / {sm_max:.0f} MHz ({100 * sm / sm_max:.0f} %)"))
+            text, sev = throttle(g["clocks_event_reasons.active"])
+            lines.append(row("  Throttling", c(text, sev)))
+            if temp is None:
+                unreadable = True
+            elif hottest is None or temp > hottest[0]:
+                hottest = (int(temp), g["index"])
+        if len(rows) > 1:
+            lines.append(row("Total power", f"{total_power:.0f} W ({len(rows)} GPUs)"))
+        if unreadable:
+            lines.append(row("Curve target", c("failsafe (a GPU temperature can't be read)", "bad")))
+        elif hottest is not None and (d := curve_duty(hottest[0])) is not None:
+            src = f" (GPU{hottest[1]}, hottest of {len(rows)})" if len(rows) > 1 else ""
+            lines.append(row("Curve target", f"{c(f'{d}%', level(d, DUTY_WARN, DUTY_HIGH))} at {hottest[0]} C{src} "
+                             + c("(service may hold higher while ramping down)", "dim")))
+    except Exception as e:
+        lines.append(row("GPU", c(f"unavailable ({e})", "bad")))
+
+    state = service_state()
+    lines.append(row("Service", f"gpu-fan-control is {c(state, 'ok' if state == 'active' else 'bad')}"))
+    lines.append(row("Thermal guard", guard_state()))
+    if os.geteuid() == 0:
+        snap = fan_snapshot()
+        if snap["err"] and snap["mode"] is None:
+            lines.append(row(fan, c(snap["err"], "bad")))
+        else:
+            lines.append(row(f"{fan} mode", c(snap["mode_text"], "ok" if snap["mode_ok"] else "warn")))
+            if snap["duty"] is not None:
+                lines.append(row(f"{fan} duty", c(f"{snap['duty']}%",
+                                                  level(snap["duty"], DUTY_WARN, DUTY_HIGH)) + " live"))
+            for sensor, rpm in snap["rpms"].items():
+                name = os.path.basename(sensor)
+                text = "no reading" if rpm is None else f"{rpm} RPM"
+                stopped = rpm is None or rpm == 0
+                lines.append(row(f"{name} speed", c(text, "bad") if stopped else text))
+            if snap["err"]:
+                lines.append(row("", c(snap["err"], "warn")))
+    else:
+        duty = last_logged_duty(fan)
+        if duty:
+            pct = int(duty.split("%")[0])
+            duty = c(f"{pct}%", level(pct, DUTY_WARN, DUTY_HIGH)) + c(duty[len(str(pct)) + 1:], "dim")
+        lines.append(row(f"{fan} duty", duty or c("unknown", "warn")))
+        lines.append(" " * 15 + c("(run with sudo for live RPM, duty and mode from the board)", "dim"))
+    return "\n".join(lines)
+
+
+VENV = Path(__file__).resolve().parent / ".venv"      # the live view's Textual, installed by setup-live-view.sh
+
+
+def live_view(interval):
+    """Show the live view, or return False when Textual isn't there.  Textual lives in .venv next to this script,
+    so when it isn't in this interpreter the script re-runs itself with the one from .venv (which works under sudo
+    too: root reads the same .venv).  Nothing is downloaded, and failing only means the plain refresh instead."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        import fan_dash
+    except ModuleNotFoundError as e:
+        if e.name not in ("textual", "rich", "fan_dash", "fan_look"):
+            raise
+        py = VENV / "bin" / "python3"
+        if py.exists() and Path(sys.prefix) != VENV:   # (not already in it: .venv/bin/python3 links to this one)
+            os.execv(str(py), [str(py), os.path.abspath(__file__), *sys.argv[1:]])
+        print(f"[!] the live view needs Textual ({e.name} is missing): "
+              f"run ./setup-live-view.sh, or use --plain", file=sys.stderr)
+        return False
+    fan_dash.run(sys.modules[__name__], interval)
+    return True
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Show GPU temperature and GPU fan speed (read-only).")
+    ap.add_argument("--version", action="version", version=f"gpu-fan-status {VERSION}")
+    ap.add_argument("-w", "--watch", nargs="?", type=float, const=2.0, metavar="SECS",
+                    help="live view, refreshed every SECS seconds (default 2)")
+    ap.add_argument("--plain", action="store_true",
+                    help="with -w: the plain-text refresh instead of the live view's screen")
+    ap.add_argument("--color", nargs="?", const="always", default="auto",
+                    choices=["auto", "always", "never"],
+                    help="colour output: auto (terminal only, default), always (bare --color), never")
+    args = ap.parse_args()
+    global COLOR
+    COLOR = (args.color == "always" or
+             (args.color == "auto" and sys.stdout.isatty() and "NO_COLOR" not in os.environ))
+    if args.watch is None:
+        print(report())
+        return
+    screen = not args.plain and os.environ.get("TERM") != "dumb" and sys.stdin.isatty() and sys.stdout.isatty()
+    if screen and live_view(args.watch):
+        return
+    try:
+        while True:
+            text = report()
+            sys.stdout.write("\033[H\033[2J" + text + "\n")
+            sys.stdout.flush()
+            time.sleep(max(1.0, args.watch))
+    except KeyboardInterrupt:
+        print()
+
+
+if __name__ == "__main__":
+    main()

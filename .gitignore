@@ -1,0 +1,14 @@
+# The live view's Textual, installed by setup-live-view.sh
+.venv/
+
+# Build output of make-zip.sh, and the wheels it can vendor
+dist/
+wheels/
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Editor leftovers
+*.swp
+*~

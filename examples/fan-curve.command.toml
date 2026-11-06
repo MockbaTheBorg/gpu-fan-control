@@ -1,0 +1,48 @@
+# Last resort: a board whose fan control is none of the three built-in backends. You supply
+# the command lines, the controller supplies the curve, the hold and the ramp-down.
+#
+# The example below is the Supermicro protocol written out by hand, which is a good way to
+# see the shape (use backend = "supermicro" for real - it also restores the previous mode,
+# reads the live duty back and knows the zone's tachs).
+
+backend = "command"
+
+# Only used to name the target in logs and on screen.
+label = "GPU fan"
+interval = 5
+failsafe_duty = 100
+min_duty = 30
+
+curve = [
+  [40, 30],
+  [50, 40],
+  [60, 55],
+  [70, 75],
+  [78, 100],
+]
+
+hold_secs = 60
+hold_band = 10
+step_down = 2
+
+# Stall detection needs command.rpm above; without it this has nothing to read.
+fan_min_rpm = 0
+
+# Tables go last in TOML: every key below this line belongs to [command].
+[command]
+# Each line is split the way a shell would split it, then run WITHOUT a shell: no pipes,
+# no redirection, no $VARS, no globs. Put anything needing those in a script and call it.
+# {duty} is replaced with the duty as a whole number of percent. {duty:#x} writes it as
+# 0x.. for tools like ipmitool raw that want hex.
+#
+# Run every check to take or keep control. Optional if there is no mode to set.
+take_over = "ipmitool raw 0x30 0x45 0x01 0x01"
+# Required. Sets the speed.
+set_duty = "ipmitool raw 0x30 0x70 0x66 0x01 0x01 {duty:#x}"
+# Run once when the service stops, to hand the fan back. Optional but strongly advised:
+# without it the fan stays wherever this left it after the service stops.
+release = "ipmitool raw 0x30 0x45 0x01 0x00"
+# Optional, must print a number: the duty the board is applying now (for gpu-fan-status).
+live_duty = "ipmitool raw 0x30 0x70 0x66 0x00 0x01"
+# Optional, must print a number: the fan's RPM, for stall detection.
+# rpm = "/usr/local/bin/my-fan-rpm"

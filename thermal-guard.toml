@@ -1,0 +1,18 @@
+# Settings for gpu-thermal-guard.service (the overheating failsafe). Read at service start:
+# after editing, run: sudo systemctl restart gpu-thermal-guard   (a trip latch survives this)
+# Log: sudo journalctl -fu gpu-thermal-guard     State: gpu-thermal-guard --status
+# GPU limits for reference: max operating 83 C, slowdown 88 C, shutdown 91 C.
+
+# Seconds between checks.
+interval = 2
+
+# Any GPU at or above this: warn and cap every GPU at its minimum power limit (100 W)...
+warn_temp = 80
+# ...and lift the cap once every GPU has been below release_temp for release_secs.
+release_temp = 75
+release_secs = 60
+
+# Any GPU at or above this: kill every GPU process (SIGTERM, then SIGKILL after
+# kill_grace seconds) and latch until: sudo gpu-thermal-guard --reset
+trip_temp = 85
+kill_grace = 10
