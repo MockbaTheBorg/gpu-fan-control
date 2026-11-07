@@ -162,7 +162,15 @@ Load the GPU and watch what happens:
 ```bash
 sudo ./setup-live-view.sh    # once: Textual into .venv, for the live view
 sudo ./gpu-fan-status -w     # big digits, graphs, the curve with "you are here"
+./gpuburn.py                 # in another shell: load every GPU for four minutes
 ```
+
+`gpuburn.py` is the load. It needs no CUDA toolkit, no compiler and no pip packages, and
+it changes no setting - it drives the GPUs through the driver's own API and stops at
+78 C, two degrees before `gpu-thermal-guard` would start capping power. It does not reach
+the board's full power limit (a 150 W-capped V100 draws about 118 W under it), so treat
+the temperature it reaches as a firm lower bound and confirm the curve against your real
+workload before trusting its headroom.
 
 Edit `fan-curve.toml` and save it — the running service picks the change up within seconds,
 no restart. Aim for the hottest GPU settling **at least 5 °C below its max operating
