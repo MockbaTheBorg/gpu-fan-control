@@ -1,4 +1,7 @@
-# Deployed configuration — host `silent`
+# Deployed configuration
+
+Two machines run this: **`silent`** (§1–8) and **`TRipper`** (§9). They have different
+boards, different fans and different curves, so very little carries across.
 
 Commissioned 2026-11-07. This records what was measured on this machine and what was
 applied as a result, so the numbers in `fan-curve.toml` can be understood (and argued
@@ -190,3 +193,52 @@ their default power limit; remove the udev rule separately.
   practice. Worth one scheduled reboot while someone is watching.
 - **Worst-case thermal load**, as described in §3.
 - Zones 2 and 3 answer duty GETs but control nothing; do not configure them.
+
+---
+
+## 9. Host `TRipper` (the development workstation)
+
+Brought up to the same standard on 2026-11-07. Different board, different backend.
+
+| | |
+|---|---|
+| Board | ASRockRack TRX40D8-2N2T, ASRock Rack BMC firmware 1.30 |
+| GPUs | 2 × Tesla V100 (`Tesla PG500-216`) |
+| Backend | `asrock`, header **FAN2**, tach **FAN2_1** |
+| Other fans | FAN1_1 (4200 RPM) and FAN3_1 (2000 RPM) stay on the BMC's own curve |
+
+ASRock sets duty and mode **per header**, not per zone, which is the main practical
+difference from `silent`: driving FAN2 leaves the other headers alone by construction,
+so there is no zone-sharing question to answer.
+
+**Measured.** FAN2 at 20 % turns 2300 RPM and at 100 % turns 9900 RPM, and the header was
+restored to `Default (BMC curve)` afterwards. During the sweep FAN1_1 appeared to "follow"
+inversely (4300 → 3700 RPM) — that is the BMC reacting to the extra airflow, not this
+header. Idle sits at 21 % / 2200 RPM with the GPUs at 41 °C.
+
+**The curve is unchanged** (`40→20, 50→30, 60→45, 70→70, 78→100`). It was measured on this
+chassis and had been holding these cards for days; there was no reason to touch it.
+
+**What did change:**
+
+- **`fan_min_rpm` 300 → 700.** The fan never turns slower than 2300 RPM when driven, so
+  the old floor would have let a fan limping at 400 RPM pass as healthy. 700 keeps a 3.3×
+  margin.
+- **An explicit `backend = "asrock"`,** plus `tach = ["FAN2_1"]` and
+  `expected_gpu_count = 2`. The old config named only `fan = 2` and let the backend be
+  inferred, which the hardened loader refuses.
+- **Config moved out of the git working tree.** The service previously read
+  `/media/mockba/Raid/gpu-fan-control/fan-curve.toml` — so checking out a branch silently
+  changed the live fan curve of a root service. It now reads `/etc/gpu-fan-control`.
+- **Programs upgraded** from a 3 November build that predated `fan_backend.py` being a
+  separate module; `gpu-fan-status` and `gpu-fan-detect` were not installed at all.
+- **Persistence mode.** The 150 W cap read as applied while persistence was `Disabled`,
+  so it was reverting whenever the cards went idle. Both GPUs now report `Enabled`.
+
+**Unprivileged status** uses `GROUP="adm"` rather than a new `gpu-fan-dev` group, because
+this account is already in `adm` and that avoided a re-login. The same caveat applies: it
+grants BMC *write* too.
+
+**Not verified here:** no sustained load test was run (deliberately — it is a desk
+machine), and it has not been rebooted since the change, so boot ordering is untested.
+The curve's behaviour under load is evidenced only by its three days of prior service.

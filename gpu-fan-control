@@ -63,8 +63,13 @@ def load_config(path):
 def validate_config(raw):
     """Validate one parsed snapshot without silently coercing hardware targets."""
     raw = dict(raw)
-    if "backend" not in raw or not ({"zone", "fan"} & raw.keys()):
-        raise ValueError("backend and an explicit fan or zone are required; no implicit hardware target")
+    if "backend" not in raw:
+        raise ValueError("backend is required; no implicit hardware target")
+    # Every backend but one addresses hardware by number, and guessing that number is how
+    # you end up driving the wrong fan. The command backend is the exception: its target
+    # is the command lines you supply, named by label, so a header number means nothing.
+    if raw["backend"] != "command" and not ({"zone", "fan"} & raw.keys()):
+        raise ValueError("an explicit fan or zone is required; no implicit hardware target")
     if "zone" in raw:               # the Supermicro name for the same thing
         if "fan" in raw:
             raise ValueError("set either fan or zone, not both (they mean the same setting)")

@@ -3,6 +3,12 @@
 # If the file has an error, the service logs it and keeps the last good settings:
 #   sudo journalctl -fu gpu-fan-control
 
+# Which kind of fan control this board has: asrock, supermicro, hwmon or command.
+# Stated explicitly - gpu-fan-control will not guess, because guessing wrong means
+# driving the wrong fan. Run `sudo gpu-fan-detect` to find out which one fits, or copy
+# a ready-made file from examples/ over this one.
+backend = "asrock"
+
 # BMC fan header to drive (1-6). The other headers stay on the BMC's Default curve.
 fan = 2
 
