@@ -8,8 +8,8 @@ Shows every GPU; the curve target follows the hottest one, as the service does.
   gpu-fan-status -w --plain the old plain-text refresh instead
   watch -c -n 2 gpu-fan-status --color   one reading under watch (needs -c and --color)
 
-The live view needs Textual; it comes from .venv next to this script (setup below) and
-the script re-runs itself there. Without it, -w falls back to the plain-text refresh.
+The prepared live view uses Textual bundled in vendor/ by build-minimal.py. It never
+re-runs a user-owned virtual environment. Missing TUI imports fail explicitly.
 
 Values are colour coded green / yellow / red. Colour is on when the output is a
 terminal; --color forces it on (for watch -c), --color=never or NO_COLOR turns it off.
@@ -20,7 +20,12 @@ sudo for those. Without root it falls back to the last duty logged by
 gpu-fan-control.service.
 """
 import argparse
+import csv
+import importlib.machinery
+import importlib.util
+import io
 import json
+import math
 import os
 import re
 import subprocess
@@ -29,9 +34,14 @@ import time
 import tomllib
 from pathlib import Path
 
+VENDOR = Path(__file__).resolve().parent / "vendor"
+if VENDOR.is_dir():
+    sys.path.insert(0, str(VENDOR))
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 sys.path.append("/usr/local/lib/gpu-fan-control")
 import fan_backend                                                  # noqa: E402
+
+_CONFIG_READER = None
 
 VERSION = fan_backend.VERSION
 CONFIG = fan_backend.find_config("fan-curve.toml", __file__)
@@ -78,16 +88,19 @@ def run(cmd, timeout=15):
 
 
 def settings():
-    """The settings file as a dict, or {} when it can't be read."""
+    """Use the controller's validation so status never describes a different target."""
+    global _CONFIG_READER
     try:
-        with open(CONFIG, "rb") as f:
-            cfg = tomllib.load(f)
-    except Exception:
-        return {}
-    if "zone" in cfg:
-        cfg.setdefault("fan", cfg.pop("zone"))
-    cfg.setdefault("fan", 2)
-    return cfg
+        if _CONFIG_READER is None:
+            loader = importlib.machinery.SourceFileLoader(
+                'status_config_reader', str(Path(__file__).resolve().parent / 'gpu-fan-control'))
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            module = importlib.util.module_from_spec(spec)
+            loader.exec_module(module)
+            _CONFIG_READER = module
+        return _CONFIG_READER.load_config(CONFIG)
+    except Exception as e:
+        raise ValueError(f"cannot load status settings {CONFIG}: {e}") from e
 
 
 _BACKEND = None
@@ -150,8 +163,7 @@ def fan_snapshot():
 def fan_curve():
     """The [temp, duty] points from the config, or None when they can't be read."""
     try:
-        with open(CONFIG, "rb") as f:
-            curve = tomllib.load(f).get("curve")
+        curve = settings()['curve']
     except Exception:
         return None
     return curve or None
@@ -175,19 +187,43 @@ def curve_duty(temp):
     return min(hi, max(lo, round(d)))
 
 
+def failsafe_duty():
+    try:
+        lo, hi = duty_limits()
+        return min(hi, max(lo, settings()['failsafe_duty']))
+    except ValueError:
+        return None
+
+
 def gpus():
     fields = ("index,name,temperature.gpu,power.draw,power.limit,utilization.gpu,"
               "clocks.sm,clocks.max.sm,clocks_event_reasons.active")
     out = run(["nvidia-smi", f"--query-gpu={fields}", "--format=csv,noheader,nounits"], timeout=20)
     keys = fields.split(",")
-    return [dict(zip(keys, (f.strip() for f in line.split(","))))
-            for line in out.strip().splitlines()]
+    rows, seen = [], set()
+    for values in csv.reader(io.StringIO(out), skipinitialspace=True, strict=True):
+        if len(values) != len(keys):
+            raise ValueError('incomplete GPU telemetry row')
+        row = dict(zip(keys, (value.strip() for value in values)))
+        index = int(row['index'])
+        if index < 0 or index in seen:
+            raise ValueError('invalid or duplicate GPU index')
+        temp = num(row['temperature.gpu'])
+        if temp is not None and temp < 0:
+            raise ValueError('negative GPU temperature')
+        seen.add(index)
+        rows.append(row)
+    expected = settings()['expected_gpu_count']
+    if not rows or (expected and len(rows) != expected):
+        raise ValueError(f"expected {expected or 'at least one'} GPU(s), received {len(rows)}")
+    return rows
 
 
 def num(text):
     try:
-        return float(text)
-    except ValueError:
+        value = float(text)
+        return value if math.isfinite(value) else None
+    except (ValueError, TypeError):
         return None
 
 
@@ -325,25 +361,21 @@ def report():
     return "\n".join(lines)
 
 
-VENV = Path(__file__).resolve().parent / ".venv"      # the live view's Textual, installed by setup-live-view.sh
-
-
 def live_view(interval):
-    """Show the live view, or return False when Textual isn't there.  Textual lives in .venv next to this script,
-    so when it isn't in this interpreter the script re-runs itself with the one from .venv (which works under sudo
-    too: root reads the same .venv).  Nothing is downloaded, and failing only means the plain refresh instead."""
+    """Show the TUI using bundled dependencies. Never re-exec a source/user venv.
+
+    Missing imports are an explicit failure, not a successful-looking plain fallback.
+    No dependency is downloaded by the status tool.
+    """
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     try:
         import fan_dash
     except ModuleNotFoundError as e:
         if e.name not in ("textual", "rich", "fan_dash", "fan_look"):
             raise
-        py = VENV / "bin" / "python3"
-        if py.exists() and Path(sys.prefix) != VENV:   # (not already in it: .venv/bin/python3 links to this one)
-            os.execv(str(py), [str(py), os.path.abspath(__file__), *sys.argv[1:]])
-        print(f"[!] the live view needs Textual ({e.name} is missing): "
-              f"run ./setup-live-view.sh, or use --plain", file=sys.stderr)
-        return False
+        print(f"[!] TUI dependencies unavailable ({e.name} is missing); rebuild the minimal "
+              "package with --with-deps or verified offline wheels. Use --plain for text.", file=sys.stderr)
+        sys.exit(1)
     fan_dash.run(sys.modules[__name__], interval)
     return True
 
@@ -355,10 +387,26 @@ def main():
                     help="live view, refreshed every SECS seconds (default 2)")
     ap.add_argument("--plain", action="store_true",
                     help="with -w: the plain-text refresh instead of the live view's screen")
+    ap.add_argument("--check-ui", action="store_true",
+                    help="verify TUI module/dependency imports without reading hardware")
     ap.add_argument("--color", nargs="?", const="always", default="auto",
                     choices=["auto", "always", "never"],
                     help="colour output: auto (terminal only, default), always (bare --color), never")
     args = ap.parse_args()
+    if args.check_ui:
+        try:
+            import fan_dash
+            import fan_look
+        except ImportError as e:
+            print(f"TUI dependencies unavailable: {e}", file=sys.stderr)
+            sys.exit(1)
+        print("TUI modules and dependencies import successfully (no hardware queried)")
+        return
+    try:
+        settings()
+    except ValueError as e:
+        print(f"Status configuration invalid: {e}", file=sys.stderr)
+        sys.exit(2)
     global COLOR
     COLOR = (args.color == "always" or
              (args.color == "auto" and sys.stdout.isatty() and "NO_COLOR" not in os.environ))

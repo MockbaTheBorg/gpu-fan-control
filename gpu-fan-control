@@ -15,14 +15,15 @@ about temperatures and ramps.
 
 Settings come from a TOML file (fan-curve.toml in the same folder, or the folder
 install.sh recorded, or --config PATH). The file is re-read whenever it changes: a
-changed curve applies on the next check, and a changed backend or target is swapped over
-with the old one handed back first.
+changed curve applies on the next check. Hardware-target and inventory changes are
+rejected during reload and require a stopped controller and reviewed restart.
 
   gpu-fan-control [--config PATH]            run the control loop
   gpu-fan-control [--config PATH] --restore  hand the fan back to the board and exit
   gpu-fan-control [--config PATH] --check    validate the settings, print the plan, exit
 """
 import argparse
+import math
 import os
 import signal
 import subprocess
@@ -39,12 +40,12 @@ DEFAULTS = {"backend": "asrock", "fan": 2, "interval": 5, "failsafe_duty": 100,
             "curve": [[40, 20], [50, 30], [60, 45], [70, 70], [78, 100]],
             "hold_secs": 60, "hold_band": 10, "step_down": 2, "fan_min_rpm": 300,
             "tach": [], "min_duty": None, "max_duty": None, "label": None,
-            "asrock": {}, "supermicro": {}, "hwmon": {}, "command": {}}
+            "asrock": {}, "supermicro": {}, "hwmon": {}, "command": {},
+            "expected_gpu_count": 0}
 NUMBERS = ("fan", "interval", "failsafe_duty", "hold_secs", "hold_band", "step_down", "fan_min_rpm")
-# Settings that decide which fan is driven and how: a change to any of them rebuilds the
-# backend, handing the old target back first.
+# Settings fixed for a running controller: file reload rejects changes to these keys.
 TARGET_KEYS = ("backend", "fan", "tach", "min_duty", "max_duty", "label",
-               "asrock", "supermicro", "hwmon", "command")
+               "asrock", "supermicro", "hwmon", "command", "expected_gpu_count")
 FAULT_CHECKS = 3                # consecutive low/OK RPM readings to enter/leave a fan fault
 
 
@@ -56,6 +57,14 @@ def log(msg, prio=None):
 def load_config(path):
     with open(path, "rb") as f:
         raw = tomllib.load(f)
+    return validate_config(raw)
+
+
+def validate_config(raw):
+    """Validate one parsed snapshot without silently coercing hardware targets."""
+    raw = dict(raw)
+    if "backend" not in raw or not ({"zone", "fan"} & raw.keys()):
+        raise ValueError("backend and an explicit fan or zone are required; no implicit hardware target")
     if "zone" in raw:               # the Supermicro name for the same thing
         if "fan" in raw:
             raise ValueError("set either fan or zone, not both (they mean the same setting)")
@@ -63,12 +72,18 @@ def load_config(path):
     cfg = {**DEFAULTS, **raw}
     if unknown := set(cfg) - set(DEFAULTS):
         raise ValueError(f"unknown setting(s): {', '.join(sorted(unknown))}")
+    count = cfg["expected_gpu_count"]
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        raise ValueError("expected_gpu_count must be an integer >= 0")
     for k in NUMBERS:
-        if isinstance(cfg[k], bool) or not isinstance(cfg[k], (int, float)):
-            raise ValueError(f"{k} must be a number")
+        if (isinstance(cfg[k], bool) or not isinstance(cfg[k], (int, float))
+                or not math.isfinite(cfg[k])):
+            raise ValueError(f"{k} must be a finite number")
+    if not isinstance(cfg['fan'], int):
+        raise ValueError('fan or zone must be an integer')
     for k in ("min_duty", "max_duty"):
-        if cfg[k] is not None and (isinstance(cfg[k], bool) or not isinstance(cfg[k], (int, float))):
-            raise ValueError(f"{k} must be a number")
+        if cfg[k] is not None and (isinstance(cfg[k], bool) or not isinstance(cfg[k], int)):
+            raise ValueError(f"{k} must be an integer")
     for k in ("asrock", "supermicro", "hwmon", "command"):
         if not isinstance(cfg[k], dict):
             raise ValueError(f"{k} must be a table, e.g. [{k}]")
@@ -76,11 +91,19 @@ def load_config(path):
         cfg["tach"] = [cfg["tach"]]
     if not isinstance(cfg["tach"], list) or any(not isinstance(t, str) for t in cfg["tach"]):
         raise ValueError('tach must be a sensor name or a list of them, e.g. tach = ["FANA"]')
-    curve = [(float(t), float(d)) for t, d in cfg["curve"]]
+    points = cfg['curve']
+    if (not isinstance(points, list) or any(
+            not isinstance(point, (list, tuple)) or len(point) != 2 or any(
+                isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
+                for v in point) for point in points)):
+        raise ValueError('curve must contain pairs of finite numbers')
+    curve = [(float(t), float(d)) for t, d in points]
     if not curve or any(t1 <= t0 for (t0, _), (t1, _) in zip(curve, curve[1:])):
         raise ValueError("curve needs at least one point with increasing temperatures")
     if any(not 0 <= d <= 100 for _, d in curve) or not 0 <= cfg["failsafe_duty"] <= 100:
         raise ValueError("duties must be 0..100 %")
+    if any(d1 < d0 for (_, d0), (_, d1) in zip(curve, curve[1:])):
+        raise ValueError('curve duties must not decrease as temperature rises')
     cfg["curve"] = curve
     for k in ("interval", "hold_secs", "step_down"):
         if cfg[k] <= 0:
@@ -105,7 +128,10 @@ class Config:
             if mtime == self.mtime:
                 return False
             self.mtime = mtime
-            self.data = load_config(self.path)
+            updated = load_config(self.path)
+            if target_of(updated) != target_of(self.data):
+                raise ValueError("hardware target changes require a stopped controller and reviewed restart")
+            self.data = updated
             self.error = None
             log(f"Reloaded {self.path}: curve {self.data['curve']}")
             return True
@@ -130,7 +156,10 @@ def gpu_temps():
     temps = {}
     for line in out.stdout.strip().splitlines():
         idx, temp = (f.strip() for f in line.split(","))
-        temps[int(idx)] = int(temp)     # "[N/A]" raises ValueError -> failsafe
+        idx, temp = int(idx), int(temp) # "[N/A]" raises ValueError -> failsafe
+        if idx < 0 or idx in temps or temp < 0:
+            raise ValueError('invalid or duplicate GPU index, or negative GPU temperature')
+        temps[idx] = temp
     if not temps:
         raise RuntimeError("nvidia-smi listed no GPUs")
     return temps
@@ -143,6 +172,14 @@ def curve_duty(curve, temp):
         if temp <= t1:
             return round(d0 + (d1 - d0) * (temp - t0) / (t1 - t0))
     return round(curve[-1][1])
+
+
+def checked_gpu_temps(cfg):
+    temps = gpu_temps()
+    expected = cfg.get("expected_gpu_count", 0)
+    if not temps or (expected and len(temps) != expected):
+        raise RuntimeError(f"expected {expected or 'at least one'} GPU(s), received {len(temps)}")
+    return temps
 
 
 class Stop(BaseException):
@@ -223,16 +260,17 @@ def control_loop(config, held):
             try:
                 readings = backend.rpms()
             except Exception:
-                readings = None         # BMC busy/unreachable: not evidence of a dead fan
+                readings = {}           # missing telemetry must not silently disable protection
+            readings = {name: readings.get(name) for name in tachs}
             if readings:
-                # A watched sensor with no reading counts as 0: it had one when we started.
-                worst = min((0 if v is None else v) for v in readings.values())
-                name = min(readings, key=lambda k: 0 if readings[k] is None else readings[k])
+                name, reading = min(readings.items(), key=lambda item: item[1] if item[1] is not None else -1)
+                worst = 0 if reading is None else reading
                 if worst < c["fan_min_rpm"]:
                     low, ok = low + 1, 0
                     if not fault and low >= FAULT_CHECKS:
                         fault = True
-                        log(f"FAN FAULT: {os.path.basename(name)} reads {worst} RPM at {current}% duty "
+                        detail = 'telemetry unavailable' if reading is None else f'reads {worst} RPM'
+                        log(f"FAN FAULT: {os.path.basename(name)} {detail} at {current}% duty "
                             f"(minimum {c['fan_min_rpm']:.0f}); holding {backend.label} at "
                             f"{backend.max_duty}% in case it restarts", prio=2)
                 else:
@@ -241,7 +279,7 @@ def control_loop(config, held):
                         fault = False
                         log(f"{backend.label} recovered ({worst} RPM); back on the curve", prio=5)
         try:
-            temps = gpu_temps()
+            temps = checked_gpu_temps(c)
             if not gpus_seen:
                 log(f"Driving {backend.label} from the hottest of {len(temps)} GPU(s): "
                     + ", ".join(f"GPU{i}" for i in sorted(temps)))
@@ -290,7 +328,7 @@ def check(config):
 
     Exit status matters: install.sh refuses to start a service that can't drive the fan.
       0  usable (as far as can be told without writing anything)
-      1  the settings describe a target this machine won't let us read
+      1  GPU/fan telemetry is unavailable, incomplete or fails the configured guard
       2  the settings file itself is unusable"""
     c = config.data
     if config.error:
@@ -307,48 +345,61 @@ def check(config):
     print(f"Duty range:    {backend.min_duty}-{backend.max_duty} %")
     print(f"Curve:         " + ", ".join(f"{t:.0f}C->{d:.0f}%" for t, d in c["curve"]))
     print(f"Failsafe:      {c['failsafe_duty']:.0f} % when a GPU temperature can't be read")
-    unreadable = None
+    failures = []
     try:
         code, text, ours = backend.mode()
         print(f"Fan mode now:  {text}" + (" <- already ours" if ours else ""))
     except Exception as e:
-        unreadable = e
+        failures.append(f"fan mode unavailable: {e}")
         print(f"Fan mode now:  can't read ({e})")
     try:
         duty = backend.live_duty()
         print(f"Live duty:     {duty} %" if duty is not None else "Live duty:     not readable")
+        if duty is None or not 0 <= duty <= 100:
+            failures.append("live fan duty unavailable or outside 0..100%")
     except Exception as e:
         print(f"Live duty:     can't read ({e})")
-    tachs = backend.tachs()
+        failures.append(f"live fan duty unavailable: {e}")
+    try:
+        tachs = backend.tachs()
+    except Exception as e:
+        tachs = []
+        failures.append(f"tach inventory unavailable: {e}")
     if not c["fan_min_rpm"]:
         print("Tach watch:    off (fan_min_rpm = 0)")
     elif not tachs:
         print("Tach watch:    off - no tach found or configured; set tach = [...] to enable it")
+        failures.append("fan fault detection requested but no tach is available")
     else:
         try:
             readings = backend.rpms()
             print("Tach watch:    " + ", ".join(
                 f"{os.path.basename(k)} {'no reading' if v is None else str(v) + ' RPM'}"
                 for k, v in readings.items()) + f" (minimum {c['fan_min_rpm']:.0f})")
+            for name in tachs:
+                rpm = readings.get(name)
+                if rpm is None or rpm <= 0 or rpm < c["fan_min_rpm"]:
+                    failures.append(f"tach {name} unavailable or below the configured RPM guard")
         except Exception as e:
             print(f"Tach watch:    {', '.join(tachs)} - can't read ({e})")
+            failures.append(f"tach telemetry unavailable: {e}")
     try:
-        temps = gpu_temps()
+        temps = checked_gpu_temps(c)
         hot = max(temps.values())
         print(f"GPUs:          " + ", ".join(f"GPU{i} {t}C" for i, t in sorted(temps.items()))
               + f" -> curve asks for {curve_duty(c['curve'], hot)} %")
     except Exception as e:
         print(f"GPUs:          unreadable ({e}) -> failsafe {c['failsafe_duty']:.0f} %")
+        failures.append(f"GPU telemetry unavailable or incomplete: {e}")
     if os.geteuid() != 0:
         print("\nNote: run with sudo to read the fan mode, duty and RPM; without root this says\n"
               "      nothing about whether the board will accept them.")
-        return 0
-    if unreadable is not None:
-        print(f"\nThe {backend.kind} backend cannot read {backend.label} on this machine:\n"
-              f"  {unreadable}\n"
-              "So it almost certainly cannot drive it either. Wrong backend for this board, or\n"
-              "the IPMI modules are not loaded. Run gpu-fan-detect to see what this board offers.")
+    if failures:
+        print("\nValidation: FAILED (read-only)")
+        for failure in failures:
+            print(f"  - {failure}")
         return 1
+    print("\nValidation: PASS (read-only telemetry; electrical safety and control scope not verified)")
     return 0
 
 
@@ -366,16 +417,14 @@ def main():
     try:
         config = Config(path)
     except Exception as e:
-        log(f"Config error in {path} ({e}); using built-in defaults", prio=3)
-        config = Config.__new__(Config)
-        config.path, config.mtime, config.error = path, None, str(e)
-        config.data = load_defaults()
+        log(f"Config error in {path} ({e}); refusing startup or restore", prio=3)
+        sys.exit(2)
     if args.check:
         sys.exit(check(config))
     if args.restore:
         # ExecStopPost backstop. Normally the controller has already handed the fan back,
-        # and at shutdown the IPMI device may already be going away, so a failure here
-        # is logged in one line (not a traceback) and doesn't mark the unit as failed.
+        # and at shutdown IPMI may be unavailable. Failure is logged and returns nonzero;
+        # a successful process exit must not falsely imply hardware recovery.
         err = None
         for attempt in range(3):
             try:
@@ -388,7 +437,7 @@ def main():
                 time.sleep(1)
         log(f"Backstop restore failed ({err}); if the controller didn't hand the fan back "
             "first, it may still be under manual control at its last duty", prio=3)
-        return
+        sys.exit(1)
     run(config)
 
 

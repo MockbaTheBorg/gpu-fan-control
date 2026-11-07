@@ -94,6 +94,8 @@ class Sampler(threading.Thread):
             rows = st.gpus()
         except Exception as e:
             snap["err"] = f"nvidia-smi unavailable ({e})"
+            snap['unreadable'] = True
+            snap['curve'] = st.failsafe_duty()
             return snap
         for g in rows:
             temp, power = st.num(g["temperature.gpu"]), st.num(g["power.draw"])
@@ -109,7 +111,7 @@ class Sampler(threading.Thread):
             elif snap["hottest"] is None or temp > snap["hottest"][0]:
                 snap["hottest"] = (int(temp), g["index"])
         if snap["unreadable"]:
-            snap["curve"] = st.curve_duty(200)          # what the service would do: failsafe
+            snap["curve"] = st.failsafe_duty()
         elif snap["hottest"]:
             snap["curve"] = st.curve_duty(snap["hottest"][0])
         return snap

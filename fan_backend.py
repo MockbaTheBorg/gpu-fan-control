@@ -53,7 +53,10 @@ def ipmi(*words, timeout=TIMEOUT):
     """ipmitool raw ... -> list of returned bytes."""
     out = run(["ipmitool", "raw", *(w if isinstance(w, str) else f"0x{w:02x}" for w in words)], timeout)
     try:
-        return [int(b, 16) for b in out.split()]
+        vals = [int(b, 16) for b in out.split()]
+        if any(not 0 <= value <= 255 for value in vals):
+            raise ValueError('reply contains a non-byte value')
+        return vals
     except ValueError:
         raise FanError(f"unexpected reply to raw {' '.join(map(str, words))}: {out.strip()!r}")
 
@@ -104,6 +107,9 @@ class Backend:
 
     def __init__(self, cfg):
         self.cfg = cfg
+        for key in ('min_duty', 'max_duty'):
+            if cfg.get(key) is not None and (isinstance(cfg[key], bool) or not isinstance(cfg[key], int)):
+                raise ValueError(f'{key} must be an integer')
         if cfg.get("min_duty") is not None:
             self.min_duty = int(cfg["min_duty"])
         if cfg.get("max_duty") is not None:
@@ -276,8 +282,14 @@ class SupermicroIpmi(IpmiBackend):
     def __init__(self, cfg):
         super().__init__(cfg)
         opts = self.options()
-        self.full_mode = int(opts.get("full_mode", 1))
-        self.zone = int(cfg["fan"])
+        self.full_mode = opts.get("full_mode", 1)
+        self.zone = cfg["fan"]
+        for key, value in (('zone', self.zone), ('full_mode', self.full_mode),
+                           ('restore_mode', opts.get('restore_mode'))):
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+                raise ValueError(f'supermicro {key} must be an integer')
+        if self.full_mode not in self.MODES or opts.get('restore_mode', 0) not in self.MODES:
+            raise ValueError('supermicro mode must be one of 0, 1, 2, 3, 4')
         if not 0 <= self.zone <= 3:
             raise ValueError("fan (the zone) must be 0..3 for the supermicro backend")
         self._restore_mode = opts.get("restore_mode")   # None: whatever the mode was at startup
@@ -289,9 +301,15 @@ class SupermicroIpmi(IpmiBackend):
 
     def _mode_code(self):
         vals = ipmi(0x30, 0x45, 0x00)
-        if not vals:
-            raise FanError("empty reply to the Supermicro get-fan-mode command (0x30 0x45 0x00)")
+        if len(vals) != 1 or vals[0] not in self.MODES:
+            raise FanError(f"invalid Supermicro fan mode reply: {vals!r}")
         return vals[0]
+
+    def drive(self, duty, write_duty=True):
+        # Mode switches can reset duty, and BMC resets/other controllers can change
+        # it without changing our software demand. Compare live duty every cycle;
+        # set_duty still skips a SET when the readback already matches.
+        super().drive(duty, write_duty=True)
 
     def take_over(self):
         code = self._mode_code()
@@ -299,6 +317,8 @@ class SupermicroIpmi(IpmiBackend):
             self._found_mode = code     # remember the board's own mode for release()
         if code != self.full_mode:
             ipmi(0x30, 0x45, 0x01, self.full_mode)
+            if self._mode_code() != self.full_mode:
+                raise FanError('Supermicro did not enter the requested fan mode')
 
     def release(self):
         back = self._restore_mode
@@ -306,6 +326,8 @@ class SupermicroIpmi(IpmiBackend):
             back = self._found_mode if self._found_mode not in (None, self.full_mode) else 0
         if self._mode_code() != int(back):
             ipmi(0x30, 0x45, 0x01, int(back))
+            if self._mode_code() != int(back):
+                raise FanError('Supermicro fan-mode restoration was not confirmed by readback')
 
     def restore_name(self):
         """What release() will set, for logging."""
@@ -317,6 +339,9 @@ class SupermicroIpmi(IpmiBackend):
     def set_duty(self, duty):
         if self.live_duty() != int(duty):
             ipmi(0x30, 0x70, 0x66, 0x01, self.zone, int(duty))
+            actual = self.live_duty()
+            if actual != int(duty):
+                raise FanError(f'Supermicro duty readback {actual}% differs from requested {int(duty)}%')
 
     def mode(self):
         code = self._mode_code()
@@ -324,7 +349,9 @@ class SupermicroIpmi(IpmiBackend):
 
     def live_duty(self):
         vals = ipmi(0x30, 0x70, 0x66, 0x00, self.zone)
-        return vals[0] if vals else None
+        if len(vals) != 1 or not 0 <= vals[0] <= 100:
+            raise FanError(f"invalid Supermicro zone duty reply: {vals!r}")
+        return vals[0]
 
     def default_tachs(self):
         """The populated headers of this zone: numbered for zone 0, lettered for zone 1."""
