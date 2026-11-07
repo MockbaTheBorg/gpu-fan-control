@@ -34,9 +34,13 @@ import time
 import tomllib
 from pathlib import Path
 
-VENDOR = Path(__file__).resolve().parent / "vendor"
-if VENDOR.is_dir():
-    sys.path.insert(0, str(VENDOR))
+# Where the live view's Textual may be bundled. Beside the script covers running from
+# an unpacked source tree; the lib directory covers an installed copy, whose programs
+# live in /usr/local/bin while its modules do not.
+for _vendor in (Path(__file__).resolve().parent / "vendor",
+                Path("/usr/local/lib/gpu-fan-control/vendor")):
+    if _vendor.is_dir():
+        sys.path.insert(0, str(_vendor))
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 sys.path.append("/usr/local/lib/gpu-fan-control")
 import fan_backend                                                  # noqa: E402
@@ -335,29 +339,33 @@ def report():
     state = service_state()
     lines.append(row("Service", f"gpu-fan-control is {c(state, 'ok' if state == 'active' else 'bad')}"))
     lines.append(row("Thermal guard", guard_state()))
-    if os.geteuid() == 0:
-        snap = fan_snapshot()
-        if snap["err"] and snap["mode"] is None:
-            lines.append(row(fan, c(snap["err"], "bad")))
-        else:
-            lines.append(row(f"{fan} mode", c(snap["mode_text"], "ok" if snap["mode_ok"] else "warn")))
-            if snap["duty"] is not None:
-                lines.append(row(f"{fan} duty", c(f"{snap['duty']}%",
-                                                  level(snap["duty"], DUTY_WARN, DUTY_HIGH)) + " live"))
-            for sensor, rpm in snap["rpms"].items():
-                name = os.path.basename(sensor)
-                text = "no reading" if rpm is None else f"{rpm} RPM"
-                stopped = rpm is None or rpm == 0
-                lines.append(row(f"{name} speed", c(text, "bad") if stopped else text))
-            if snap["err"]:
-                lines.append(row("", c(snap["err"], "warn")))
-    else:
+    # Ask the board whatever our uid is. Root is the usual way in, but a udev rule can
+    # hand the ipmi device to a group, and then an unprivileged status is just as live.
+    # Only fall back to what the service logged if the read really did not work.
+    snap = fan_snapshot()
+    if snap["mode"] is None and snap["duty"] is None and not snap["rpms"]:
         duty = last_logged_duty(fan)
         if duty:
             pct = int(duty.split("%")[0])
             duty = c(f"{pct}%", level(pct, DUTY_WARN, DUTY_HIGH)) + c(duty[len(str(pct)) + 1:], "dim")
         lines.append(row(f"{fan} duty", duty or c("unknown", "warn")))
-        lines.append(" " * 15 + c("(run with sudo for live RPM, duty and mode from the board)", "dim"))
+        if os.geteuid() == 0:
+            lines.append(row("", c(snap["err"] or "the board would not answer", "bad")))
+        else:
+            lines.append(" " * 15 + c("(run with sudo - or grant this user the ipmi device - "
+                                      "for live RPM, duty and mode)", "dim"))
+    else:
+        lines.append(row(f"{fan} mode", c(snap["mode_text"], "ok" if snap["mode_ok"] else "warn")))
+        if snap["duty"] is not None:
+            lines.append(row(f"{fan} duty", c(f"{snap['duty']}%",
+                                              level(snap["duty"], DUTY_WARN, DUTY_HIGH)) + " live"))
+        for sensor, rpm in snap["rpms"].items():
+            name = os.path.basename(sensor)
+            text = "no reading" if rpm is None else f"{rpm} RPM"
+            stopped = rpm is None or rpm == 0
+            lines.append(row(f"{name} speed", c(text, "bad") if stopped else text))
+        if snap["err"]:
+            lines.append(row("", c(snap["err"], "warn")))
     return "\n".join(lines)
 
 

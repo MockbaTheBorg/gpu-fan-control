@@ -79,6 +79,22 @@ def gpus(index=None):
     return rows
 
 
+def persistence_on():
+    """Keep the driver resident, so a power limit actually survives being set.
+
+    With persistence mode off the driver tears down GPU state whenever no client holds
+    the device open, and the board quietly returns to its default limit: `cool` reports
+    success, and seconds later the limit is 250 W again. Ubuntu ships
+    nvidia-persistenced with --no-persistence-mode, so this is the normal case, not an
+    exotic one."""
+    try:
+        smi("-pm", "1")
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        detail = ((getattr(e, "stdout", "") or "") + (getattr(e, "stderr", "") or "")).strip()
+        print(f"Warning: could not enable persistence mode ({detail or e}); the limit may "
+              "revert to the default once the GPUs go idle", file=sys.stderr)
+
+
 def show(index):
     cool = cool_watts()
     for g in gpus(index):
@@ -100,7 +116,9 @@ def main():
     if os.geteuid() != 0:
         sys.exit("Setting the power limit needs root: run with sudo")
     plan = []                       # check every GPU first, so a bad value changes none of them
+    defaults = {}
     for g in gpus(args.index):
+        defaults[g["index"]] = g["default"]
         word = args.limit.lower()
         if word == "cool":
             watts = cool_watts()
@@ -115,11 +133,22 @@ def main():
             sys.exit(f"GPU{g['index']}: {watts:.0f} W is outside the allowed "
                      f"{g['min']:.0f}-{g['max']:.0f} W")
         plan.append((g["index"], watts))
+    if any(watts != defaults[index] for index, watts in plan):
+        persistence_on()            # or the limit below evaporates when the GPUs go idle
     for index, watts in plan:
         try:
             smi("-i", index, "-pl", f"{watts:.0f}")
         except subprocess.CalledProcessError as e:
             sys.exit(f"GPU{index}: nvidia-smi failed: {(e.stdout + e.stderr).strip()}")
+    # nvidia-smi exits 0 whether or not the limit stuck, so read it back rather than
+    # trust it: a silent no-op here means the GPUs cook at their default limit while
+    # the service reports success.
+    applied = {g["index"]: g["limit"] for g in gpus(args.index)}
+    missed = [f"GPU{i} is at {applied.get(i, float('nan')):.0f} W, not {w:.0f} W"
+              for i, w in plan if abs(applied.get(i, -1.0) - w) > 0.5]
+    if missed:
+        sys.exit("The power limit did not stick: " + "; ".join(missed) +
+                 ".\nPersistence mode may be off and unsettable; check nvidia-persistenced.")
     show(args.index)
 
 

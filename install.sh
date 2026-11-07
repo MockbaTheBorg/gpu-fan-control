@@ -100,8 +100,12 @@ fi
 # ------------------------------------------------------------------ programs
 say "Programs"
 install -d -m 755 "$LIBDIR"
-install -m 644 "$HERE/fan_backend.py" "$LIBDIR/fan_backend.py"
-echo "  $LIBDIR/fan_backend.py"
+# fan_dash/fan_look are the live view: gpu-fan-status adds $LIBDIR to sys.path and
+# imports them, so without these an installed copy can never run `gpu-fan-status -w`.
+for mod in fan_backend.py fan_dash.py fan_look.py; do
+  install -m 644 "$HERE/$mod" "$LIBDIR/$mod"
+  echo "  $LIBDIR/$mod"
+done
 for prog in gpu-fan-control gpu-fan-status gpu-fan-detect gpu-power-limit gpu-thermal-guard; do
   install -m 755 "$HERE/$prog" "$BINDIR/$prog"
   echo "  $BINDIR/$prog"
@@ -110,11 +114,16 @@ printf '# Written by gpu-fan-control install.sh - where the .toml settings files
   "$CONFDIR" > /etc/gpu-fan-control.conf
 echo "  /etc/gpu-fan-control.conf  (CONFIG_DIR=$CONFDIR)"
 
-# The live view's Textual lives in a .venv beside the package, and gpu-fan-status re-runs
-# itself with it; the installed copy needs to know where that is.
-if [ -x "$HERE/.venv/bin/python3" ]; then
-  ln -sfn "$HERE/.venv" "$LIBDIR/.venv"
-  echo "  $LIBDIR/.venv -> $HERE/.venv  (the live view's Textual)"
+# The live view needs Textual. gpu-fan-status imports it from a root-owned vendor
+# directory beside the modules rather than re-running itself out of a venv that any
+# user could write to. Populate one with:
+#   python3 -m pip install --target vendor --no-index --find-links wheels textual
+if [ -d "$HERE/vendor" ]; then
+  install -d -m 755 "$LIBDIR/vendor"
+  cp -a "$HERE/vendor/." "$LIBDIR/vendor/"
+  chown -R root:root "$LIBDIR/vendor"
+  chmod -R go-w "$LIBDIR/vendor"
+  echo "  $LIBDIR/vendor  (the live view's Textual)"
 fi
 
 # ------------------------------------------------------------------ IPMI modules

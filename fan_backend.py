@@ -25,6 +25,7 @@ import os
 import re
 import shlex
 import subprocess
+import time
 
 VERSION = "1.00"                                # the whole package: shown by --version
 TIMEOUT = 15
@@ -337,11 +338,23 @@ class SupermicroIpmi(IpmiBackend):
         return self.MODES.get(int(back), f"mode {back}")
 
     def set_duty(self, duty):
-        if self.live_duty() != int(duty):
-            ipmi(0x30, 0x70, 0x66, 0x01, self.zone, int(duty))
-            actual = self.live_duty()
-            if actual != int(duty):
-                raise FanError(f'Supermicro duty readback {actual}% differs from requested {int(duty)}%')
+        want = int(duty)
+        if self.live_duty() == want:
+            return
+        # Verify the board really took the duty - but give it a moment to. Entering full
+        # mode resets the duty register, and this BMC can report the old value for up to
+        # a second after the write, so a single immediate readback reports a phantom
+        # mismatch on the first write after take_over(). Re-issue the SET a couple of
+        # times before believing it: a duty that never lands is a real fault.
+        actual = None
+        for _ in range(3):
+            ipmi(0x30, 0x70, 0x66, 0x01, self.zone, want)
+            for _ in range(4):
+                time.sleep(0.25)
+                actual = self.live_duty()
+                if actual == want:
+                    return
+        raise FanError(f'Supermicro duty readback {actual}% differs from requested {want}%')
 
     def mode(self):
         code = self._mode_code()

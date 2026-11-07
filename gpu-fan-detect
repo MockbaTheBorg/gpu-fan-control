@@ -193,10 +193,35 @@ def probe(args):
 
 
 # -------------------------------------------------------------------------------- spin test
+def detected_backend():
+    """Which backend this board actually answers to.
+
+    --spin-all used to fall back to "asrock" when it had no settings file to read. On
+    any other board every command then failed against the wrong OEM namespace and the
+    sweep reported "no tach followed any target" - a wrong answer that looks exactly
+    like a 3-pin fan. Ask the board instead of guessing.
+    """
+    try:
+        vendor = probe_vendor_commands()
+    except FanError:
+        vendor = {}
+    for kind in ("supermicro", "asrock"):
+        if vendor.get(kind, (False,))[0]:
+            return kind
+    try:
+        if any(ch["pwms"] for ch in probe_hwmon()):
+            return "hwmon"
+    except FanError:
+        pass
+    sys.exit("No OEM fan commands answered and no hwmon pwm output, so there is nothing\n"
+             "to spin. Run plain `sudo gpu-fan-detect` first, or name the backend with\n"
+             "--backend / a --config settings file.")
+
+
 def candidates(args, cfg):
     """[(name, cfg)] for every target worth testing with --spin-all."""
     out = []
-    kind = args.backend or cfg.get("backend", "asrock")
+    kind = args.backend or cfg.get("backend") or detected_backend()
     if kind == "asrock":
         for n in range(1, 7):
             out.append((f"FAN{n}", {**cfg, "backend": "asrock", "fan": n, "tach": []}))
