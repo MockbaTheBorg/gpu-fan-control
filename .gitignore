@@ -1,6 +1,9 @@
 # The live view's Textual, installed by setup-live-view.sh
 .venv/
 
+# The live view's Textual, vendored for install.sh to copy into the lib dir
+vendor/
+
 # Build output of make-zip.sh, and the wheels it can vendor
 dist/
 wheels/
