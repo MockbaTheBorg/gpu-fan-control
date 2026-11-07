@@ -47,6 +47,9 @@ class Sampler(threading.Thread):
         self.q: queue.Queue = queue.Queue()
         self.done = threading.Event()
         self.root = os.geteuid() == 0
+        # Whether the board answers us. Root is the usual way in, but a udev rule can
+        # hand the ipmi device to a group, so start optimistic and let a read decide.
+        self.board = True
         self.slow = {"mode": None, "duty": None, "duty_src": "", "rpms": {}, "svc": "?", "guard": None, "err": None}
 
     def stop(self) -> None:
@@ -58,7 +61,7 @@ class Sampler(threading.Thread):
         log_every = every(20)                           # journalctl, when there is no root: expensive
         tick = 0
         while not self.done.is_set():
-            if tick % (fan_every if self.root else log_every) == 0:
+            if tick % (fan_every if self.board else log_every) == 0:
                 self.read_fan()
             if tick % svc_every == 0:
                 self.read_services()
@@ -67,20 +70,29 @@ class Sampler(threading.Thread):
             self.done.wait(self.interval)
 
     def read_fan(self) -> None:
-        """The fan half of a reading: whatever the configured backend can tell us.  Without root
-        the BMC backends can't be read at all, so the duty comes from the service's own log."""
+        """The fan half of a reading: whatever the configured backend can tell us.
+
+        Ask the board every time, whatever our uid is: root is the usual way to reach the
+        BMC, but a udev rule can grant the ipmi device to a group, and then an
+        unprivileged live view is just as live. Only when the board really will not
+        answer do we fall back to the duty the service last logged - which is both
+        expensive to read and silent while the duty holds steady, so it shows "?" on a
+        machine that has simply been sitting at one duty for a while."""
         st = self.st
-        if not self.root:
-            duty = st.last_logged_duty(self.fan)
-            self.slow.update(duty=int(duty.split("%")[0]) if duty else None,
-                             duty_src="from the service log" if duty else "",
-                             mode=None, mode_text="needs sudo", mode_ok=False)
-            return
         snap = st.fan_snapshot()
-        self.slow.update(mode=snap["mode"], mode_text=snap["mode_text"], mode_ok=snap["mode_ok"],
-                         duty=snap["duty"], duty_src=snap["duty_src"], err=snap["err"],
-                         rpms={os.path.basename(k): ("no reading" if v is None else f"{v} RPM")
-                               for k, v in snap["rpms"].items()})
+        if snap["mode"] is not None or snap["duty"] is not None or snap["rpms"]:
+            self.board = True
+            self.slow.update(mode=snap["mode"], mode_text=snap["mode_text"], mode_ok=snap["mode_ok"],
+                             duty=snap["duty"], duty_src=snap["duty_src"], err=snap["err"],
+                             rpms={os.path.basename(k): ("no reading" if v is None else f"{v} RPM")
+                                   for k, v in snap["rpms"].items()})
+            return
+        self.board = False
+        duty = st.last_logged_duty(self.fan)
+        self.slow.update(duty=int(duty.split("%")[0]) if duty else None,
+                         duty_src="from the service log" if duty else "",
+                         mode=None, mode_ok=False, err=snap["err"],
+                         mode_text="unreadable" if self.root else "needs sudo")
 
     def read_services(self) -> None:
         self.slow["svc"] = self.st.service_state("gpu-fan-control")
