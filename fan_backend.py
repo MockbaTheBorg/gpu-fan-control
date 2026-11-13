@@ -20,10 +20,14 @@ whether the mode or the duty has to be written first, what "hand it back" means 
 tachometers belong to the target - and the controller stays vendor-neutral.
 
 Read-only probing for gpu-fan-detect is at the bottom (probe_* functions).
+
+The IPMI backends cache the BMC's sensor catalogue on disk - see SDR_CACHE - because
+walking it costs seconds per tachometer read and the readings themselves do not.
 """
 import os
 import re
 import shlex
+import stat
 import subprocess
 import time
 
@@ -62,13 +66,129 @@ def ipmi(*words, timeout=TIMEOUT):
         raise FanError(f"unexpected reply to raw {' '.join(map(str, words))}: {out.strip()!r}")
 
 
+# ------------------------------------------------------------------------------ SDR cache
+# Reading a tachometer asks the BMC two different questions: where the sensor lives in the
+# Sensor Data Repository, and what it reads right now. Over the KCS interface the first
+# costs seconds - the whole repository is walked a few bytes per packet - and the second
+# costs milliseconds. The repository only changes when sensors are added or erased or the
+# BMC firmware is replaced, so dump it once and hand the dump back to ipmitool with -S:
+# ipmitool still fetches every value live, it just stops re-reading the catalogue.
+# Measured on a TRX40D8-2N2T (BMC 1.30, 65 records): 8-10 s per call becomes 0.4 s, which
+# matters because gpu-fan-control reads the tach on every check of its interval.
+SDR_CACHE = "sdr-cache"                 # in _sdr_cache_dirs(), with a ".id" file beside it
+SDR_RECHECK = 300                       # seconds between re-asking the BMC if it changed
+_sdr = {"path": None, "checked": 0.0}   # per process: the validated dump, and when
+
+
+def _sdr_cache_dirs():
+    """Where a dump may live. The shared one first: root writes it, any uid may read it."""
+    dirs = ["/var/cache/gpu-fan-control"]
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    if os.geteuid() != 0 and os.path.isabs(base):
+        dirs.append(os.path.join(base, "gpu-fan-control"))
+    return dirs
+
+
+def _sdr_trusted(path):
+    """True if path is a plain file, owned by root or us, that no one else can write.
+
+    ipmitool parses this file, so a dump another user could have swapped is not one we
+    hand it: a bogus catalogue would rename sensors and so misdirect the tach watch."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return (stat.S_ISREG(st.st_mode) and st.st_nlink == 1
+            and st.st_uid in (0, os.geteuid()) and not st.st_mode & 0o022)
+
+
+def _sdr_id():
+    """What the BMC says about its repository; changes when the catalogue would."""
+    info = ipmi(0x0a, 0x20, timeout=10)         # Get SDR Repository Info: version, count
+    dev = ipmi(0x06, 0x01, timeout=10)          # Get Device ID: firmware revision
+    return " ".join(f"{b:02x}" for b in info + dev)
+
+
+def _sdr_write(want):
+    """Dump the repository once, atomically, and stamp it with `want`. None if we can't."""
+    for d in _sdr_cache_dirs():
+        cache = os.path.join(d, SDR_CACHE)
+        tmp, tmp_id = f"{cache}.{os.getpid()}", f"{cache}.id.{os.getpid()}"
+        try:
+            os.makedirs(d, mode=0o755, exist_ok=True)
+            run(["ipmitool", "sdr", "dump", tmp], timeout=max(TIMEOUT, 30))
+            if not os.path.getsize(tmp):
+                raise FanError("ipmitool wrote an empty SDR dump")
+            with open(tmp_id, "w") as f:
+                f.write(want + "\n")
+            os.chmod(tmp, 0o644)
+            os.chmod(tmp_id, 0o644)
+            os.replace(tmp, cache)              # the dump lands before the stamp that
+            os.replace(tmp_id, f"{cache}.id")   # vouches for it, never the other way
+            return cache
+        except (OSError, FanError):
+            for leftover in (tmp, tmp_id):
+                try:
+                    os.unlink(leftover)
+                except OSError:
+                    pass
+    return None
+
+
+def sdr_cache():
+    """A dump that still matches the BMC, for ipmitool -S, or None to walk the repository.
+
+    Revalidated every SDR_RECHECK seconds, so a long-running controller notices a BMC
+    that was reflashed or had sensors added underneath it. Never raises: every failure
+    here just means reading the repository the slow, always-correct way."""
+    if os.environ.get("GPU_FAN_SDR_CACHE", "").strip().lower() in ("0", "no", "off"):
+        return None
+    now = time.monotonic()
+    if _sdr["checked"] and now - _sdr["checked"] < SDR_RECHECK:
+        return _sdr["path"]
+    path = None
+    try:
+        want = _sdr_id()
+        for d in _sdr_cache_dirs():
+            cache = os.path.join(d, SDR_CACHE)
+            if not (_sdr_trusted(cache) and _sdr_trusted(f"{cache}.id")):
+                continue
+            try:
+                with open(f"{cache}.id") as f:
+                    if f.read().strip() == want and os.path.getsize(cache):
+                        path = cache
+                        break
+            except OSError:
+                continue
+        if path is None:
+            path = _sdr_write(want)
+    except (FanError, OSError):
+        path = None
+    _sdr.update(path=path, checked=now)
+    return path
+
+
 def sdr_fans():
     """{sensor name: rpm or None} for every fan sensor the BMC knows.
 
     None means the sensor exists but has no reading (empty header, or a fan that has
-    stopped). One ipmitool call for all of them."""
+    stopped). One ipmitool call for all of them, against a cached copy of the sensor
+    catalogue when there is a valid one - see SDR_CACHE above."""
+    cache = sdr_cache()
+    fans = _sdr_fans_via(cache)
+    if not fans and cache:
+        # An empty answer from a cached catalogue is indistinguishable from a board with
+        # no fan sensors, and silently losing the tach watch is worse than being slow.
+        _sdr.update(path=None, checked=0.0)
+        fans = _sdr_fans_via(None)
+    return fans
+
+
+def _sdr_fans_via(cache):
+    """Parse `ipmitool sdr type Fan`, optionally against a dumped catalogue."""
     fans = {}
-    for line in run(["ipmitool", "sdr", "type", "Fan"]).splitlines():
+    args = ["-S", cache] if cache else []
+    for line in run(["ipmitool", *args, "sdr", "type", "Fan"]).splitlines():
         cols = [c.strip() for c in line.split("|")]
         if len(cols) < 2 or not cols[0]:
             continue

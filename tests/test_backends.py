@@ -20,6 +20,7 @@ sys.path.insert(0, HERE)
 import fan_backend as fb                                                        # noqa: E402
 
 SENT = []
+REAL_SDR_FANS = fb.sdr_fans          # cases that stub it out must not blind the ones after
 
 
 def recorder(reply):
@@ -236,6 +237,119 @@ def _():
                     ["fanctl", "--rpm"],
                     ["fanctl", "--auto"]]
             and rpm == {"GPU fan": 7200} and b.label == "GPU fan")
+
+
+# --------------------------------------------------------------------------- SDR cache
+def sdr_harness(d, answer=None):
+    """Point the cache at a temp dir, record the ipmitool argv, answer `sdr type Fan`.
+
+    Returns (calls, restore). The BMC's repository id is fixed, so a stamp written by
+    one call is still valid for the next unless a test changes it."""
+    calls = []
+    answer = answer or (lambda cmd: "FAN2_1 | 61h | ok | 7.0 | 2400 RPM\n")
+
+    def fake_run(cmd, timeout=fb.TIMEOUT):
+        calls.append(cmd)
+        if "dump" in cmd:
+            open(cmd[-1], "w").write("not-a-real-dump-but-not-empty")
+            return ""
+        return answer(cmd)
+    saved = fb.run, fb.ipmi, fb._sdr_cache_dirs, fb.sdr_fans, dict(fb._sdr)
+    fb.run = fake_run
+    # Get SDR Repository Info, then Get Device ID: together they fingerprint the catalogue
+    fb.ipmi = lambda *w, **k: [0x51, 0x41] if w[0] == 0x0a else [0x20, 0x81]
+    fb._sdr_cache_dirs = lambda: [d]
+    fb.sdr_fans = REAL_SDR_FANS
+    fb._sdr.update(path=None, checked=0.0)
+
+    def restore():
+        fb.run, fb.ipmi, fb._sdr_cache_dirs, fb.sdr_fans = saved[:4]
+        fb._sdr.clear()
+        fb._sdr.update(saved[4])
+    return calls, restore
+
+
+@case("the fan sensors are read against a dumped catalogue, dumped once")
+def _():
+    with tempfile.TemporaryDirectory() as d:
+        calls, restore = sdr_harness(d)
+        try:
+            first = fb.sdr_fans()
+            fb._sdr.update(checked=0.0)         # force the next call to revalidate
+            second = fb.sdr_fans()
+        finally:
+            restore()
+        cache = os.path.join(d, fb.SDR_CACHE)
+        dumps = [c for c in calls if "dump" in c]
+        reads = [c for c in calls if "dump" not in c]
+        return (first == second == {"FAN2_1": 2400}
+                and len(dumps) == 1                             # the slow walk happens once
+                and len(reads) == 2                             # both readings are still live
+                and all(r[1:3] == ["-S", cache] for r in reads)
+                and os.path.exists(cache + ".id"))
+
+
+@case("a catalogue the BMC no longer matches is dumped again, not trusted")
+def _():
+    with tempfile.TemporaryDirectory() as d:
+        calls, restore = sdr_harness(d)
+        try:
+            fb.sdr_fans()
+            open(os.path.join(d, fb.SDR_CACHE + ".id"), "w").write("a different bmc\n")
+            fb._sdr.update(path=None, checked=0.0)
+            fans = fb.sdr_fans()
+            stamp = open(os.path.join(d, fb.SDR_CACHE + ".id")).read().strip()
+        finally:
+            restore()
+        return (len([c for c in calls if "dump" in c]) == 2
+                and fans == {"FAN2_1": 2400} and stamp == "51 41 20 81")
+
+
+@case("a catalogue another user could rewrite is refused")
+def _():
+    with tempfile.TemporaryDirectory() as d:
+        calls, restore = sdr_harness(d)
+        try:
+            fb.sdr_fans()
+            cache = os.path.join(d, fb.SDR_CACHE)
+            os.chmod(cache, 0o666)                              # world-writable: untrusted
+            trusted = fb._sdr_trusted(cache)
+            fb._sdr.update(path=None, checked=0.0)
+            fans = fb.sdr_fans()
+            mode = os.stat(cache).st_mode & 0o777
+        finally:
+            restore()
+        return not trusted and fans == {"FAN2_1": 2400} and mode == 0o644
+
+
+@case("an empty answer from the catalogue falls back to walking the repository")
+def _():
+    with tempfile.TemporaryDirectory() as d:
+        # a cached read that finds no fan sensor must not silently disable the tach watch
+        calls, restore = sdr_harness(d, answer=lambda cmd: (
+            "" if "-S" in cmd else "FAN2_1 | 61h | ok | 7.0 | 2400 RPM\n"))
+        try:
+            fans = fb.sdr_fans()
+        finally:
+            restore()
+        reads = [c for c in calls if "dump" not in c]
+        return (fans == {"FAN2_1": 2400} and len(reads) == 2
+                and "-S" in reads[0] and "-S" not in reads[1]
+                and fb._sdr["path"] is None)                    # and the cache is dropped
+
+
+@case("GPU_FAN_SDR_CACHE=0 reads the repository directly")
+def _():
+    with tempfile.TemporaryDirectory() as d:
+        calls, restore = sdr_harness(d)
+        os.environ["GPU_FAN_SDR_CACHE"] = "0"
+        try:
+            fans = fb.sdr_fans()
+        finally:
+            del os.environ["GPU_FAN_SDR_CACHE"]
+            restore()
+        return (fans == {"FAN2_1": 2400} and len(calls) == 1
+                and "-S" not in calls[0] and not os.listdir(d))
 
 
 @case("command insists on set_duty")

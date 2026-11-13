@@ -330,6 +330,35 @@ sudo ipmitool raw 0x3a 0xda                # ASRock: live duty per header (hex %
 Each backend in `fan_backend.py` writes a duty one way. All of them are in-band — no network
 access to the BMC and no BMC password.
 
+### The sensor catalogue cache (BMC backends)
+
+Reading a fan tachometer asks the BMC two unrelated questions: *where* the sensor lives in
+the Sensor Data Repository, and *what it reads now*. Over the in-band KCS interface the
+first costs seconds — the whole repository is walked a few bytes per packet — and the
+second costs milliseconds. On this machine (65 records, BMC 1.30) `ipmitool sdr type Fan`
+took **8–10 s**, which dwarfed everything else `gpu-fan-status` collects and, worse, ran on
+every check of the controller's 5 s `interval`.
+
+So the repository is dumped once and handed back to `ipmitool -S`, which still fetches
+every reading live and only stops re-reading the catalogue:
+
+| | before | after |
+|---|---|---|
+| one tach read | 8–10 s | 0.3–0.4 s |
+| `gpu-fan-status` | 4.6–7.7 s | 0.5–1.1 s |
+| first run (dumps the catalogue) | — | ~3–7 s, once |
+
+The dump lives in `/var/cache/gpu-fan-control/sdr-cache` when written by root (the service),
+otherwise in `~/.cache/gpu-fan-control/`; an unprivileged status run reads root's copy when
+there is one. Before each use the BMC is asked for its repository info and firmware revision
+(two raw commands, ~0.2 s, re-checked every 5 minutes per process); if either has changed —
+a reflash, sensors added or erased — the dump is discarded and taken again. A dump that is
+not a plain file owned by root or you, or that anyone else could write, is refused rather
+than parsed, and if a cached read reports no fan sensors at all the repository is walked the
+slow way instead, so a bad cache can never quietly disable fan-fault detection.
+
+`GPU_FAN_SDR_CACHE=0` turns the whole thing off and always walks the repository.
+
 ### `asrock` — ASRock Rack OEM IPMI (this machine)
 
 Through `ipmitool raw`, netfn `0x3a`. Each command takes or returns 16 bytes,
